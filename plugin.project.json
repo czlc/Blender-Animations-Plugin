@@ -1,5 +1,5 @@
 {
-  "name": "BlenderAnimationsPlugin",
+  "name": "BlenderAnimationsInternal",
   "tree": {
     "$path": "src/ServerScriptService/BlenderAnimationsInternal"
   }
