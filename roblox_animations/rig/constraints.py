@@ -20,12 +20,23 @@ def link_object_to_bone_rigid(obj, ao, bone):
     constraint = obj.constraints.new(type="CHILD_OF")
     constraint.target = ao
     constraint.subtarget = bone.name
+    set_child_of_bone_inverse(constraint, ao, bone)
+
+
+def set_child_of_bone_inverse(constraint, armature, bone):
+    """Set a Child Of inverse that preserves the object's rest-space offset."""
     bone_mat = getattr(bone, "matrix_local", None)
     if bone_mat is None:
-        bone_mat = bone.matrix
+        bone_mat = getattr(bone, "matrix", None)
+    if bone_mat is None:
+        return
     if hasattr(bone_mat, "to_4x4"):
         bone_mat = bone_mat.to_4x4()
-    constraint.inverse_matrix = (ao.matrix_world @ bone_mat).inverted()
+    target_rest = armature.matrix_world @ bone_mat
+    try:
+        constraint.inverse_matrix = target_rest.inverted()
+    except Exception:
+        constraint.inverse_matrix = target_rest.inverted_safe()
 
 
 def auto_constraint_parts(armature_name, skip_objects=None):
@@ -122,22 +133,25 @@ def auto_constraint_parts(armature_name, skip_objects=None):
             used_bones.add(bone_name)
 
             # Ensure exactly one correct Child Of constraint exists
-            correct_constraint_found = False
+            correct_constraint = None
             
             for c in list(obj.constraints):
                 if c.type == "CHILD_OF":
                     is_correct_target = (c.target == armature)
                     is_correct_bone = (c.subtarget == bone_name)
                     
-                    if is_correct_target and is_correct_bone and not correct_constraint_found:
-                        correct_constraint_found = True
+                    if is_correct_target and is_correct_bone and correct_constraint is None:
+                        correct_constraint = c
                     else:
                         obj.constraints.remove(c)
 
-            if not correct_constraint_found:
-                constraint = obj.constraints.new(type="CHILD_OF")
-                constraint.target = armature
-                constraint.subtarget = bone_name
+            if correct_constraint is None:
+                correct_constraint = obj.constraints.new(type="CHILD_OF")
+                correct_constraint.target = armature
+                correct_constraint.subtarget = bone_name
+            bone = armature.data.bones.get(bone_name)
+            if bone:
+                set_child_of_bone_inverse(correct_constraint, armature, bone)
             
             matched_parts.append(obj.name)
 
@@ -179,5 +193,8 @@ def manual_constraint_parts(armature_name, bone_mesh_assignments):
             constraint = obj.constraints.new(type="CHILD_OF")
             constraint.target = armature
             constraint.subtarget = bone_name
+            bone = armature.data.bones.get(bone_name)
+            if bone:
+                set_child_of_bone_inverse(constraint, armature, bone)
 
     return True, "Constraints updated."

@@ -28,6 +28,7 @@ from .rig_ops import (
     OBJECT_OT_TogglePhysicsGhost,
     OBJECT_OT_ToggleRotationMomentum,
     OBJECT_OT_ToggleWeldBones,
+    OBJECT_OT_ToggleHelperBones,
     OBJECT_OT_WorldSpaceUnparent,
     OBJECT_OT_WorldSpaceReparent,
 )
@@ -55,6 +56,9 @@ from .validation_ops import (
 )
 from .test_ops import (
     OBJECT_OT_RunTests,
+)
+from .debug_ops import (
+    OBJECT_OT_DebugRigBindings,
 )
 from .auth_ops import (
     OBJECT_OT_RbxOAuthLogin,
@@ -86,6 +90,7 @@ __all__ = [
     "OBJECT_OT_TogglePhysicsGhost",
     "OBJECT_OT_ToggleRotationMomentum",
     "OBJECT_OT_ToggleWeldBones",
+    "OBJECT_OT_ToggleHelperBones",
     "OBJECT_OT_WorldSpaceUnparent",
     "OBJECT_OT_WorldSpaceReparent",
     # Animation operators
@@ -106,6 +111,8 @@ __all__ = [
     "StopServerOperator",
     # Test operators
     "OBJECT_OT_RunTests",
+    # Debug operators
+    "OBJECT_OT_DebugRigBindings",
     # OAuth operators
     "OBJECT_OT_RbxOAuthLogin",
     "OBJECT_OT_RbxOAuthCancelLogin",

@@ -3,7 +3,7 @@ Constraint management operators for linking objects to bones.
 """
 
 import bpy
-from ..rig.constraints import auto_constraint_parts
+from ..rig.constraints import auto_constraint_parts, set_child_of_bone_inverse
 from ..core.utils import (
     find_master_collection_for_object,
     find_parts_collection_in_master,
@@ -199,6 +199,9 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
                 constraint = obj.constraints.new(type="CHILD_OF")
                 constraint.target = armature
                 constraint.subtarget = bone_name
+                bone = armature.data.bones.get(bone_name)
+                if bone:
+                    set_child_of_bone_inverse(constraint, armature, bone)
 
         self.report({"INFO"}, "Constraints updated.")
         return {"FINISHED"}

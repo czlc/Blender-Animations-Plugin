@@ -270,8 +270,8 @@ def _meta_has_skinned_meshes(meta_loaded):
 def _meta_is_majority_skinned(meta_loaded):
     """Return True when most body-part MeshParts have explicit skinning data.
 
-    Distinguishes proper skinned rigs (most limbs skinned -> CONNECT) from
-    hybrid rigs (only a few parts skinned, e.g. head -> LOCAL_YAXIS_EXTEND).
+    Used only as a fallback for MeshPart candidates that do not explicitly
+    export Roblox Bone/deform metadata.
     """
     total = 0
     skinned = 0
@@ -2090,7 +2090,7 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".obj"
     filter_glob: bpy.props.StringProperty(default="*.obj", options={"HIDDEN"})
-    filepath: bpy.props.StringProperty(name="File Path", maxlen=1024, default="")
+    filepath: bpy.props.StringProperty(name="File Path", maxlen=1024, default="", subtype="FILE_PATH")
 
     def execute(self, context):
         # Do not clear objects
@@ -2295,7 +2295,15 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
             if has_deform_bones or has_filemesh_candidates:
                 try:
                     majority_skinned = _meta_is_majority_skinned(meta_loaded)
-                    bone_mode = "CONNECT" if majority_skinned else "LOCAL_YAXIS_EXTEND"
+                    if has_deform_bones or has_skinned_mesh_metadata:
+                        # Skinned Roblox Bone rigs must keep the exported rest
+                        # matrices. CONNECT/LOCAL modes are nicer to look at,
+                        # but changing the edit-bone tail/roll also changes the
+                        # Armature modifier bind basis and causes detachment
+                        # when pose bones are rotated.
+                        bone_mode = "RAW"
+                    else:
+                        bone_mode = "CONNECT" if majority_skinned else "LOCAL_YAXIS_EXTEND"
                     print(f"[RigImport] auto-generating armature for deform/filemesh-candidate rig (mode={bone_mode}, majority_skinned={majority_skinned})")
                     create_rig(bone_mode, ob.name)
                     if has_skinned_mesh_metadata:
@@ -3103,7 +3111,7 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".fbx"
     filter_glob: bpy.props.StringProperty(default="*.fbx", options={"HIDDEN"})
-    filepath: bpy.props.StringProperty(name="File Path", maxlen=1024, default="")
+    filepath: bpy.props.StringProperty(name="File Path", maxlen=1024, default="", subtype="FILE_PATH")
 
     @classmethod
     def poll(cls, context):

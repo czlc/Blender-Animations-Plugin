@@ -595,9 +595,19 @@ function RigPart:Encode(handledParts, opts)
 					elem.jointtransform1 = { CFrame.new():GetComponents() }
 				end
 			elseif jointInstance:IsA("WeldConstraint") then
-				-- WeldConstraint doesn't have C0/C1, use relative transform
-				local parentToChild = (jointInstance :: any).Part0.CFrame:ToObjectSpace((jointInstance :: any).Part1.CFrame)
-				elem.jointtransform0 = { parentToChild:GetComponents() }
+				-- WeldConstraint doesn't expose C0/C1. Use the traversal parent -> child
+				-- offset so reversed Part0/Part1 welds encode the same hierarchy.
+				local parentPart = partParent.part
+				local parentToChild = nil
+				if parentPart and parentPart:IsA("BasePart") then
+					parentToChild = (parentPart :: BasePart).CFrame:ToObjectSpace(part.CFrame)
+				else
+					local weldConstraint = jointInstance :: any
+					local weldParent = self.jointParentIsPart0 and weldConstraint.Part0 or weldConstraint.Part1
+					local weldChild = self.jointParentIsPart0 and weldConstraint.Part1 or weldConstraint.Part0
+					parentToChild = weldParent.CFrame:ToObjectSpace(weldChild.CFrame)
+				end
+				elem.jointtransform0 = { (parentToChild :: CFrame):GetComponents() }
 				elem.jointtransform1 = { CFrame.new():GetComponents() }
 			end
 			elem.jointType = jointInstance.ClassName

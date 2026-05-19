@@ -209,6 +209,29 @@ def is_deform_bone_rig(armature: "bpy.types.Object") -> bool:
     return False
 
 
+def _bone_data(pose_or_data_bone):
+    return getattr(pose_or_data_bone, "bone", pose_or_data_bone)
+
+
+def _has_motor_metadata(pose_or_data_bone) -> bool:
+    bone_data = _bone_data(pose_or_data_bone)
+    return (
+        bone_data is not None
+        and "transform" in bone_data
+        and "transform1" in bone_data
+        and "nicetransform" in bone_data
+    )
+
+
+def _is_imported_deform_bone(pose_or_data_bone) -> bool:
+    bone_data = _bone_data(pose_or_data_bone)
+    return bool(bone_data is not None and bone_data.get("rbx_is_deform_bone", False))
+
+
+def _serializes_as_motor_bone(pose_or_data_bone) -> bool:
+    return _has_motor_metadata(pose_or_data_bone) and not _is_imported_deform_bone(pose_or_data_bone)
+
+
 def extract_bone_hierarchy(armature: "bpy.types.Object") -> Dict[str, Optional[str]]:
     """
     Extracts the bone hierarchy from an armature.
@@ -285,11 +308,7 @@ def serialize_animation_state(
     for bone in pose_bones:
         if is_face_control_bone(bone):
             continue
-        has_motor6d_props = (
-            "transform" in bone.bone
-            and "transform1" in bone.bone
-            and "nicetransform" in bone.bone
-        )
+        has_motor6d_props = _serializes_as_motor_bone(bone)
 
         if has_motor6d_props:
             # --- Traditional Motor6D bone logic ---
@@ -320,11 +339,7 @@ def serialize_animation_state(
                 
                 if original_parent_bone:
                     # Get the original parent's transforms
-                    parent_has_motor6d = (
-                        "transform" in original_parent_bone.bone
-                        and "transform1" in original_parent_bone.bone
-                        and "nicetransform" in original_parent_bone.bone
-                    )
+                    parent_has_motor6d = _serializes_as_motor_bone(original_parent_bone)
                     
                     if parent_has_motor6d:
                         pcb = ensure_cache(original_parent_name)
@@ -370,11 +385,7 @@ def serialize_animation_state(
                     bone_transform = orig_base_mat.inverted() @ cur_obj_transform
 
             elif bone.parent:
-                parent_has_motor6d_props = (
-                    "transform" in bone.parent.bone
-                    and "transform1" in bone.parent.bone
-                    and "nicetransform" in bone.parent.bone
-                )
+                parent_has_motor6d_props = _serializes_as_motor_bone(bone.parent)
                 if parent_has_motor6d_props:
                     pcb = ensure_cache(bone.parent.name)
                     parent_extr_inv = pcb.get("extr_inv")
@@ -457,12 +468,11 @@ def serialize_deform_animation_state(
             continue
         if excluded_bones and bone.name in excluded_bones:
             continue
-        # Exclude Motor6D bones from deform serialization
-        if (
-            "transform" in bone.bone
-            and "transform1" in bone.bone
-            and "nicetransform" in bone.bone
-        ):
+        # Exclude true Motor6D bones from deform serialization. Imported Roblox
+        # Bone instances can still carry transform/nicetransform metadata so
+        # their original CFrame survives export, but their animation must be
+        # serialized as Bone.Transform deltas.
+        if _serializes_as_motor_bone(bone):
             continue
         bones_to_process.append(bone)
 
@@ -483,11 +493,7 @@ def serialize_deform_animation_state(
             return bone_cache.get(bone.parent.name)
 
         # Parent is not in cache, check if it's a motor6d bone
-        parent_has_motor6d_props = (
-            "transform" in bone.parent.bone
-            and "transform1" in bone.parent.bone
-            and "nicetransform" in bone.parent.bone
-        )
+        parent_has_motor6d_props = _serializes_as_motor_bone(bone.parent)
 
         if parent_has_motor6d_props:
             # Convert motor6d parent to roblox space for deform calculation (cached)
@@ -536,8 +542,19 @@ def serialize_deform_animation_state(
         else:
             delta_transform = rest_matrix.inverted() @ current_matrix
 
-        # Branch behavior: deform bones vs new/helper bones
-        if is_skinned_rig and bone.bone.use_deform:
+        # Branch behavior: imported Roblox Bone vs Blender-authored deform/helper bones.
+        if _is_imported_deform_bone(bone):
+            # Imported Roblox Bone rest/current matrices are already compared in
+            # Roblox space above. Applying the generic Blender deform swizzle here
+            # flips local rotation directions during Studio sync.
+            tr = delta_transform.to_translation()
+            rot_m3 = delta_transform.to_3x3()
+            try:
+                rot_m3.normalize()
+            except Exception:
+                pass
+            final_transform = Matrix.Translation(tr) @ rot_m3.to_4x4()
+        elif is_skinned_rig and bone.bone.use_deform:
             # Deform bones: apply corrected Roblox space conversion (axis swizzles and scaling)
             loc, rot, sca = delta_transform.decompose()
             sf = scale_factor if scale_factor != 0 else 1.0
@@ -722,11 +739,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     # is_skinned_rig: true deform/skin rig (armature modifier) or forced by user
     # has_new_bones: bones without Motor6D props present (should run deform path, but not mark rig as deform)
     has_new_bones = any(
-        not (
-            "transform" in bone.bone
-            and "transform1" in bone.bone
-            and "nicetransform" in bone.bone
-        )
+        not _serializes_as_motor_bone(bone)
         and not is_face_control_bone(bone)
         for bone in ao_eval.pose.bones
     )

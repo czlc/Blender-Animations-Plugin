@@ -853,6 +853,86 @@ class OBJECT_OT_ToggleRotationMomentum(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _is_weld_bone(bone):
+    joint_type = bone.get("rbx_joint_type", "Motor6D")
+    return joint_type in ("Weld", "WeldConstraint")
+
+
+def _is_helper_bone(bone, has_imported_deform_bones=False):
+    if bone.get("rbx_face_deform_bone", False):
+        return False
+    if _is_weld_bone(bone):
+        return True
+    if bone.get("rbx_is_deform_bone", False):
+        return False
+    if bone.get("rbx_helper_bone", False):
+        return True
+    if has_imported_deform_bones and "transform" in bone:
+        return True
+    return not bool(getattr(bone, "use_deform", False))
+
+
+def _set_bone_hidden(bone, hidden):
+    try:
+        bone.hide = hidden
+    except Exception:
+        pass
+
+
+def _ensure_bone_collection(amt, collection_name, predicate):
+    try:
+        collections = amt.collections
+    except Exception:
+        return None
+
+    bone_coll = collections.get(collection_name)
+    if bone_coll is None:
+        bone_coll = collections.new(collection_name)
+
+    for bone in amt.bones:
+        if predicate(bone):
+            try:
+                bone_coll.assign(bone)
+            except Exception:
+                pass
+
+    return bone_coll
+
+
+def _apply_helper_bone_visibility(amt, hide_helpers, hide_welds):
+    helper_count = 0
+    weld_count = 0
+    has_imported_deform_bones = any(
+        bone.get("rbx_is_deform_bone", False)
+        for bone in amt.bones
+    )
+
+    helper_coll = _ensure_bone_collection(
+        amt,
+        "_HelperBones",
+        lambda bone: _is_helper_bone(bone, has_imported_deform_bones),
+    )
+    weld_coll = _ensure_bone_collection(amt, "_WeldBones", _is_weld_bone)
+
+    if helper_coll is not None:
+        helper_coll.is_visible = not hide_helpers
+    if weld_coll is not None:
+        weld_coll.is_visible = not hide_welds
+
+    for bone in amt.bones:
+        is_weld = _is_weld_bone(bone)
+        is_helper = _is_helper_bone(bone, has_imported_deform_bones)
+        if is_weld:
+            weld_count += 1
+        if is_helper:
+            helper_count += 1
+            _set_bone_hidden(bone, hide_helpers or (is_weld and hide_welds))
+        elif is_weld:
+            _set_bone_hidden(bone, hide_welds)
+
+    return helper_count, weld_count
+
+
 class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):
     """Toggle visibility of weld bones in the armature"""
     bl_label = "Toggle Weld Bones"
@@ -872,42 +952,44 @@ class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):
         
         armature = context.active_object
         if armature and armature.type == "ARMATURE":
-            amt = armature.data
-            count = 0
-            
-            try:
-                collections = amt.collections
-                use_collections = True
-            except Exception:
-                collections = None
-                use_collections = False
-            
-            if use_collections:
-                weld_coll_name = "_WeldBones"
-                weld_coll = collections.get(weld_coll_name)
-                
-                if weld_coll is None:
-                    weld_coll = collections.new(weld_coll_name)
-                    for bone in amt.bones:
-                        joint_type = bone.get("rbx_joint_type", "Motor6D")
-                        if joint_type in ("Weld", "WeldConstraint"):
-                            weld_coll.assign(bone)
-                            count += 1
-                else:
-                    count = len([b for b in amt.bones if b.get("rbx_joint_type") in ("Weld", "WeldConstraint")])
-                
-                weld_coll.is_visible = not hide
-            else:
-                # Blender 3.x fallback
-                for bone in amt.bones:
-                    joint_type = bone.get("rbx_joint_type", "Motor6D")
-                    if joint_type in ("Weld", "WeldConstraint"):
-                        bone.hide = hide
-                        count += 1
-            
+            _, count = _apply_helper_bone_visibility(
+                armature.data,
+                getattr(settings, "rbx_hide_helper_bones", False),
+                hide,
+            )
             state = "hidden" if hide else "visible"
             self.report({"INFO"}, f"{count} weld bones now {state}")
         
+        return {"FINISHED"}
+
+
+class OBJECT_OT_ToggleHelperBones(bpy.types.Operator):
+    """Toggle visibility of non-deforming helper bones in the armature"""
+    bl_label = "Toggle Helper Bones"
+    bl_idname = "object.rbxanims_toggle_helper_bones"
+    bl_description = "Show or hide non-deforming helper bones without deleting them"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == "ARMATURE"
+
+    def execute(self, context):
+        settings = context.scene.rbx_anim_settings
+        settings.rbx_hide_helper_bones = not settings.rbx_hide_helper_bones
+        hide = settings.rbx_hide_helper_bones
+
+        armature = context.active_object
+        if armature and armature.type == "ARMATURE":
+            count, _ = _apply_helper_bone_visibility(
+                armature.data,
+                hide,
+                getattr(settings, "rbx_hide_weld_bones", False),
+            )
+            state = "hidden" if hide else "visible"
+            self.report({"INFO"}, f"{count} helper bones now {state}")
+
         return {"FINISHED"}
 
 

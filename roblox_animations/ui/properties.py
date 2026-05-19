@@ -244,6 +244,12 @@ class RobloxAnimationSettings(PropertyGroup):
         default=False,
     )
 
+    rbx_hide_helper_bones: BoolProperty(
+        name="Hide Helper Bones",
+        description="hide non-deforming helper bones in the viewport without removing them from the rig",
+        default=False,
+    )
+
     rbx_face_controls_expanded: BoolProperty(
         name="Show Face Controls",
         description="show or hide the roblox face control sliders",

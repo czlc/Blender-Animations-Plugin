@@ -79,6 +79,7 @@ _classes = [
     _resolve_operator_class("OBJECT_OT_ToggleRotationMomentum"),
     # Weld bone visibility
     _resolve_operator_class("OBJECT_OT_ToggleWeldBones"),
+    _resolve_operator_class("OBJECT_OT_ToggleHelperBones"),
     # World-space unparent
     _resolve_operator_class("OBJECT_OT_WorldSpaceUnparent"),
     _resolve_operator_class("OBJECT_OT_WorldSpaceReparent"),
@@ -90,6 +91,7 @@ _classes = [
     _resolve_operator_class("OBJECT_OT_ValidateMotionPaths"),
     _resolve_operator_class("OBJECT_OT_ClearMotionPathValidation"),
     _resolve_operator_class("OBJECT_OT_RunTests"),
+    _resolve_operator_class("OBJECT_OT_DebugRigBindings", fallback_module="debug_ops"),
     # Constraint operators
     _resolve_operator_class("OBJECT_OT_AutoConstraint"),
     _resolve_operator_class("OBJECT_OT_ManualConstraint"),

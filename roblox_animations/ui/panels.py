@@ -113,7 +113,14 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
 
         row = server_box.row(align=True)
         if not get_server_status():
-            row.operator("object.start_server", text="Start Server", icon="PLAY")
+            start_row = row.row(align=True)
+            start_row.scale_y = 1.2
+            start_row.operator(
+                "object.start_server",
+                text="Start Server",
+                icon="PLAY",
+                depress=True,
+            )
         else:
             row.operator("object.stop_server", text="Stop Server", icon="PAUSE")
         settings = getattr(scene, "rbx_anim_settings", None)
@@ -136,6 +143,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             account_box.label(text="Online access is disabled in Blender preferences.", icon="ERROR")
             login_row = account_box.row()
             login_row.enabled = False
+            login_row.scale_y = 1.2
             login_row.operator(
                 "rbx.oauth_login",
                 text="Log In to Roblox",
@@ -143,10 +151,13 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             )
         else:
             account_box.label(text="Not logged in, required for deform/skinned rigs.", icon="INFO")
-            account_box.operator(
+            login_row = account_box.row()
+            login_row.scale_y = 1.2
+            login_row.operator(
                 "rbx.oauth_login",
                 text="Log In to Roblox",
                 icon="LINKED",
+                depress=True,
             )
 
         # --- 3. ARMATURE OPERATIONS ---
@@ -207,15 +218,25 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         col.operator(
             "object.rbxanims_manualconstraint", text="Manual Constraint Editor"
         )
+        col.operator(
+            "object.rbxanims_debug_rig_bindings", text="Debug Rig Bindings"
+        )
         col.separator()
 
         # Toggle weld bone visibility
         weld_row = col.row(align=True)
         weld_row.operator(
             "object.rbxanims_toggle_weld_bones",
-            text="Hide Weld Bones" if settings.rbx_hide_weld_bones else "Show Weld Bones",
-            icon="HIDE_ON" if settings.rbx_hide_weld_bones else "HIDE_OFF",
+            text="Show Weld Bones" if settings.rbx_hide_weld_bones else "Hide Weld Bones",
+            icon="HIDE_OFF" if settings.rbx_hide_weld_bones else "HIDE_ON",
             depress=settings.rbx_hide_weld_bones
+        )
+        helper_row = col.row(align=True)
+        helper_row.operator(
+            "object.rbxanims_toggle_helper_bones",
+            text="Show Helper Bones" if settings.rbx_hide_helper_bones else "Hide Helper Bones",
+            icon="HIDE_OFF" if settings.rbx_hide_helper_bones else "HIDE_ON",
+            depress=settings.rbx_hide_helper_bones
         )
         ik_row = col.row(align=True)
         # check if selected bones have IK constraints

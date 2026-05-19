@@ -3,6 +3,7 @@ Rig creation and bone management utilities.
 """
 
 import json
+import math
 import re
 import bpy
 from mathutils import Vector, Matrix
@@ -125,19 +126,22 @@ def _build_part_to_bone_map(rig_node, result=None):
     return result
 
 
-def _mesh_bones_overlap_rig(mesh_bone_names, rig_names, part_to_bone_map=None):
+def _mesh_bones_overlap_rig(mesh_bone_names, rig_names, part_to_bone_map=None, bone_alias_map=None):
     if not mesh_bone_names or not rig_names:
         return False
 
     if rig_names.intersection(mesh_bone_names):
         return True
 
-    if not part_to_bone_map:
-        return False
+    if bone_alias_map:
+        for bone_name in mesh_bone_names:
+            if bone_alias_map.get(bone_name) in rig_names:
+                return True
 
-    for bone_name in mesh_bone_names:
-        if part_to_bone_map.get(bone_name) in rig_names:
-            return True
+    if part_to_bone_map:
+        for bone_name in mesh_bone_names:
+            if part_to_bone_map.get(bone_name) in rig_names:
+                return True
 
     return False
 
@@ -351,6 +355,273 @@ def _iter_rig_node_names(node):
         yield jname
     for child in node.get("children", []):
         yield from _iter_rig_node_names(child)
+
+
+def _iter_rig_nodes(node):
+    if not isinstance(node, dict):
+        return
+    yield node
+    for child in node.get("children", []):
+        yield from _iter_rig_nodes(child)
+
+
+def _normalized_bone_key(name):
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _rig_node_bind_matrix(node):
+    transform = node.get("transform")
+    if not transform:
+        return None
+    try:
+        matrix = cf_to_mat(transform)
+        joint_transform = node.get("jointtransform1") or node.get("jointTransform1")
+        if joint_transform:
+            matrix = matrix @ cf_to_mat(joint_transform)
+        return get_transform_to_blender() @ matrix
+    except Exception:
+        return None
+
+
+def _collect_rig_bind_matrices(rig_def):
+    deform = {}
+    all_nodes = {}
+    for node in _iter_rig_nodes(rig_def):
+        name = node.get("jname")
+        if not name:
+            continue
+        matrix = _rig_node_bind_matrix(node)
+        if matrix is None:
+            continue
+        all_nodes[name] = matrix
+        if node.get("isDeformBone") or node.get("jointType") == "Bone":
+            deform[name] = matrix
+    return deform, all_nodes
+
+
+def _build_filemesh_bone_alias_map(binding, rig_bind_matrices, fallback_bind_matrices=None):
+    """Map FileMesh bone names to exported Roblox Bone names by bind pose.
+
+    Some Roblox assets keep skin weights keyed by the mesh asset's bone names,
+    while the scene hierarchy can expose renamed Bone instances. Exact name
+    matching is still preferred; this fills the gap by comparing bind-pose
+    world positions.
+    """
+    mesh_data = binding.get("mesh_data") or {}
+    records = mesh_data.get("bones") or []
+    if not records:
+        return {}
+
+    candidates = rig_bind_matrices or fallback_bind_matrices or {}
+    if not candidates:
+        return {}
+
+    candidate_norm = {
+        _normalized_bone_key(name): name
+        for name in candidates.keys()
+    }
+    deform_names = set(rig_bind_matrices.keys()) if rig_bind_matrices else set()
+
+    entry = binding.get("entry") or {}
+    size_values = entry.get("part_size") or entry.get("mesh_size") or [1.0, 1.0, 1.0]
+    try:
+        max_extent = max(abs(float(v)) for v in size_values)
+    except Exception:
+        max_extent = 1.0
+    max_distance = max(0.15, max_extent * 0.15)
+
+    alias_map = {}
+    used_targets = set()
+    for record in records:
+        source_name = record.get("name") or record.get("resolved_name")
+        if not source_name:
+            continue
+        if source_name in deform_names:
+            continue
+
+        normalized = _normalized_bone_key(source_name)
+        normalized_target = candidate_norm.get(normalized)
+        if normalized_target and normalized_target not in used_targets:
+            alias_map[source_name] = normalized_target
+            used_targets.add(normalized_target)
+            continue
+
+        source_matrix = _build_filemesh_bone_world_matrix(binding, record)
+        if source_matrix is None:
+            continue
+        source_pos = source_matrix.to_translation()
+
+        best_name = None
+        best_score = None
+        best_distance = None
+        for target_name, target_matrix in candidates.items():
+            if target_name in used_targets:
+                continue
+            target_pos = target_matrix.to_translation()
+            distance = (target_pos - source_pos).length
+            rotation_penalty = 0.0
+            try:
+                source_rot = source_matrix.to_3x3()
+                target_rot = target_matrix.to_3x3()
+                for row in range(3):
+                    for col in range(3):
+                        rotation_penalty += abs(source_rot[row][col] - target_rot[row][col])
+            except Exception:
+                pass
+            score = distance + rotation_penalty * 0.01
+            if best_score is None or score < best_score:
+                best_score = score
+                best_name = target_name
+                best_distance = distance
+
+        if best_name and best_distance is not None and best_distance <= max_distance:
+            alias_map[source_name] = best_name
+            used_targets.add(best_name)
+
+    if alias_map:
+        mesh_name = (binding.get("entry") or {}).get("name") or "<mesh>"
+        print(f"[RigCreate] FileMesh bone aliases for '{mesh_name}': {alias_map}")
+    return alias_map
+
+
+def _log_filemesh_bind_pose_matches(binding, rig_bind_matrices, fallback_bind_matrices=None):
+    mesh_data = binding.get("mesh_data") or {}
+    records = mesh_data.get("bones") or []
+    if not records:
+        return
+
+    target_matrices = {}
+    target_matrices.update(fallback_bind_matrices or {})
+    target_matrices.update(rig_bind_matrices or {})
+    if not target_matrices:
+        return
+
+    part_to_bone = binding.get("part_to_bone_map") or {}
+    bone_alias_map = binding.get("bone_alias_map") or {}
+    mesh_name = (binding.get("entry") or {}).get("name") or "<mesh>"
+    focus_terms = ("arm", "leg", "torso", "root", "hand", "shoulder")
+    deltas = []
+
+    for record in records:
+        source_name = record.get("name") or record.get("resolved_name")
+        if not source_name:
+            continue
+        resolved_name = bone_alias_map.get(source_name) or part_to_bone.get(source_name, source_name)
+        target_matrix = target_matrices.get(resolved_name)
+        if target_matrix is None:
+            continue
+        source_matrix = _build_filemesh_bone_world_matrix(binding, record)
+        if source_matrix is None:
+            continue
+
+        source_pos = source_matrix.to_translation()
+        target_pos = target_matrix.to_translation()
+        delta = (source_pos - target_pos).length
+        deltas.append(delta)
+
+        source_lower = str(source_name).lower()
+        target_lower = str(resolved_name).lower()
+        is_focus = any(term in source_lower or term in target_lower for term in focus_terms)
+        if is_focus or delta > 0.05:
+            print(
+                f"[RigCreate] Bind pose check '{mesh_name}': "
+                f"filemesh='{source_name}' -> rig='{resolved_name}', "
+                f"delta={delta:.5f}, "
+                f"filemesh_pos=({source_pos.x:.4f},{source_pos.y:.4f},{source_pos.z:.4f}), "
+                f"rig_pos=({target_pos.x:.4f},{target_pos.y:.4f},{target_pos.z:.4f})"
+            )
+
+    if deltas:
+        avg_delta = sum(deltas) / len(deltas)
+        print(
+            f"[RigCreate] Bind pose summary '{mesh_name}': "
+            f"matched={len(deltas)}/{len(records)}, max={max(deltas):.5f}, avg={avg_delta:.5f}"
+        )
+
+
+def _matrix_rotation_difference(left, right):
+    try:
+        left_rot = left.to_3x3()
+        right_rot = right.to_3x3()
+        total = 0.0
+        for row in range(3):
+            for col in range(3):
+                total += abs(left_rot[row][col] - right_rot[row][col])
+        return total
+    except Exception:
+        return 0.0
+
+
+def _resolve_filemesh_record_bone_name(binding, record):
+    source_name = record.get("name") or record.get("resolved_name")
+    if not source_name:
+        return None
+
+    bone_alias_map = binding.get("bone_alias_map") or {}
+    part_to_bone = binding.get("part_to_bone_map") or {}
+    return bone_alias_map.get(source_name) or part_to_bone.get(source_name, source_name)
+
+
+def _collect_skin_bind_rest_matrices(bindings, rig_names, rig_bind_matrices=None):
+    """Collect FileMesh bind matrices to use as Blender deform rest matrices.
+
+    Roblox MeshParts carry their own skin bind pose. Bone instances with the
+    same names can be offset from that bind pose, so Blender must use the
+    FileMesh bind matrices for armature deformation and preserve the exported
+    Roblox CFrame through nicetransform for serialization.
+    """
+    if not bindings or not rig_names:
+        return {}
+
+    samples = {}
+    for binding in bindings.values():
+        mesh_data = binding.get("mesh_data") or {}
+        for record in mesh_data.get("bones") or []:
+            resolved_name = _resolve_filemesh_record_bone_name(binding, record)
+            if resolved_name not in rig_names:
+                continue
+
+            matrix = _build_filemesh_bone_world_matrix(binding, record)
+            if matrix is None:
+                continue
+            samples.setdefault(resolved_name, []).append(matrix)
+
+    result = {}
+    spread_warnings = []
+    for bone_name, matrices in samples.items():
+        base = matrices[0].copy()
+        result[bone_name] = base
+
+        max_pos_spread = 0.0
+        max_rot_spread = 0.0
+        for matrix in matrices[1:]:
+            max_pos_spread = max(
+                max_pos_spread,
+                (matrix.to_translation() - base.to_translation()).length,
+            )
+            max_rot_spread = max(max_rot_spread, _matrix_rotation_difference(matrix, base))
+        if max_pos_spread > 0.02 or max_rot_spread > 0.05:
+            spread_warnings.append((bone_name, len(matrices), max_pos_spread, max_rot_spread))
+
+    if result:
+        deltas = []
+        for bone_name, bind_matrix in result.items():
+            rig_matrix = (rig_bind_matrices or {}).get(bone_name)
+            if rig_matrix is None:
+                continue
+            deltas.append((bind_matrix.to_translation() - rig_matrix.to_translation()).length)
+        delta_text = ""
+        if deltas:
+            delta_text = f", avg_meta_delta={sum(deltas) / len(deltas):.5f}, max_meta_delta={max(deltas):.5f}"
+        print(f"[RigCreate] Skin bind rest overrides: bones={len(result)}{delta_text}")
+
+    for bone_name, count, pos_spread, rot_spread in spread_warnings[:10]:
+        print(
+            f"[RigCreate] WARNING: skin bind samples for bone '{bone_name}' disagree "
+            f"(samples={count}, pos_spread={pos_spread:.5f}, rot_spread={rot_spread:.5f})"
+        )
+
+    return result
 
 
 def _normalize_vector(vector):
@@ -1580,8 +1851,10 @@ def _build_source_topology_binding(binding, target_faces=None):
 
 
 def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
-    rig_names = set(_iter_rig_node_names(meta_loaded.get("rig") or {}))
-    part_to_bone_map = _build_part_to_bone_map(meta_loaded.get("rig") or {})
+    rig_def = meta_loaded.get("rig") or {}
+    rig_names = set(_iter_rig_node_names(rig_def))
+    rig_deform_bind_matrices, rig_all_bind_matrices = _collect_rig_bind_matrices(rig_def)
+    part_to_bone_map = _build_part_to_bone_map(rig_def)
     bindings = {}
     wrap_target_snapshot = _build_wrap_target_snapshot(meta_loaded, parts_collection)
 
@@ -1623,10 +1896,23 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
             binding_mesh_data = _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj)
             binding["mesh_data"] = binding_mesh_data
             vertex_weights = binding_mesh_data.get("vertex_weights") or []
+            bone_alias_map = _build_filemesh_bone_alias_map(
+                binding,
+                rig_deform_bind_matrices,
+                fallback_bind_matrices=rig_all_bind_matrices,
+            )
+            if bone_alias_map:
+                binding["bone_alias_map"] = bone_alias_map
+            _log_filemesh_bind_pose_matches(
+                binding,
+                rig_deform_bind_matrices,
+                fallback_bind_matrices=rig_all_bind_matrices,
+            )
             bone_overlap = _mesh_bones_overlap_rig(
                 binding_mesh_data.get("bone_names") or [],
                 rig_names,
                 part_to_bone_map,
+                bone_alias_map,
             )
             has_weights = _has_meaningful_vertex_weights(vertex_weights)
             if wrap_layer_metadata:
@@ -1757,6 +2043,9 @@ def _build_filemesh_bone_world_matrix(binding, bone_record):
         entry.get("part_size"),
         entry.get("mesh_size") or entry.get("part_size"),
     )
+    # FileMesh bone translations share the same mesh-local coordinate frame as
+    # vertex positions, so MeshPart size scaling is required before applying
+    # the part CFrame.
     local_matrix.translation = Vector(
         (
             float(translation[0]) * scale[0],
@@ -1977,6 +2266,7 @@ def _run_weight_transfer_sequence(mesh_obj, source_obj, available_bones, initial
 
 def _determine_binding_fallback_bone(binding, available_bones):
     part_to_bone = binding.get("part_to_bone_map") or {}
+    bone_alias_map = binding.get("bone_alias_map") or {}
     entry = binding.get("entry") or {}
 
     entry_name = entry.get("name")
@@ -1987,7 +2277,7 @@ def _determine_binding_fallback_bone(binding, available_bones):
     resolved_weight_totals = {}
     for weights in binding.get("mesh_data", {}).get("vertex_weights") or []:
         for bone_name, weight in (weights or {}).items():
-            resolved = part_to_bone.get(bone_name, bone_name)
+            resolved = bone_alias_map.get(bone_name) or part_to_bone.get(bone_name, bone_name)
             if resolved in available_bones and weight > 0:
                 resolved_weight_totals[resolved] = resolved_weight_totals.get(resolved, 0.0) + float(weight)
 
@@ -1997,7 +2287,11 @@ def _determine_binding_fallback_bone(binding, available_bones):
     return None
 
 
-def _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone=None):
+def _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone=None, bone_alias_map=None):
+    bone_alias_map = bone_alias_map or {}
+    resolved = bone_alias_map.get(bone_name)
+    if resolved in available_bones:
+        return resolved
     resolved = part_to_bone.get(bone_name, bone_name)
     if resolved in available_bones:
         return resolved
@@ -2023,6 +2317,7 @@ def _get_position_transfer_vertices(binding):
 
 def _build_transfer_source_object(mesh_obj, armature_obj, binding):
     part_to_bone = binding.get("part_to_bone_map") or {}
+    bone_alias_map = binding.get("bone_alias_map") or {}
     available_bones = {bone.name for bone in armature_obj.data.bones}
     fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
     vertex_weights = binding.get("binding_vertex_weights") or binding["mesh_data"].get("vertex_weights") or []
@@ -2065,6 +2360,7 @@ def _build_transfer_source_object(mesh_obj, armature_obj, binding):
                 part_to_bone,
                 available_bones,
                 fallback_bone=fallback_bone,
+                bone_alias_map=bone_alias_map,
             )
             if resolved and resolved not in groups:
                 groups[resolved] = source_obj.vertex_groups.new(name=resolved)
@@ -2081,6 +2377,7 @@ def _build_transfer_source_object(mesh_obj, armature_obj, binding):
                 part_to_bone,
                 available_bones,
                 fallback_bone=fallback_bone,
+                bone_alias_map=bone_alias_map,
             )
             group = groups.get(resolved)
             if group and weight > 0:
@@ -2207,6 +2504,7 @@ def _apply_position_bound_weights(mesh_obj, armature_obj, binding):
     pure nearest-position fallback for any target verts whose UV has no filemesh match.
     """
     part_to_bone = binding.get("part_to_bone_map") or {}
+    bone_alias_map = binding.get("bone_alias_map") or {}
     available_bones = {bone.name for bone in armature_obj.data.bones}
     fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
 
@@ -2219,7 +2517,13 @@ def _apply_position_bound_weights(mesh_obj, armature_obj, binding):
     bone_names = mesh_data.get("bone_names") or []
     groups = {}
     for bone_name in bone_names:
-        resolved = _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone)
+        resolved = _resolve_binding_bone_name(
+            bone_name,
+            part_to_bone,
+            available_bones,
+            fallback_bone,
+            bone_alias_map,
+        )
         if resolved and resolved not in groups:
             groups[resolved] = mesh_obj.vertex_groups.new(name=resolved)
     if not groups:
@@ -2411,7 +2715,13 @@ def _apply_position_bound_weights(mesh_obj, armature_obj, binding):
 
         weights_src = vertex_weights[best_src] or {}
         for bone_name, weight in weights_src.items():
-            resolved = _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone)
+            resolved = _resolve_binding_bone_name(
+                bone_name,
+                part_to_bone,
+                available_bones,
+                fallback_bone,
+                bone_alias_map,
+            )
             group = groups.get(resolved)
             if group and weight > 0:
                 group.add([tgt_idx], float(weight), "REPLACE")
@@ -2436,6 +2746,7 @@ def _apply_position_bound_weights(mesh_obj, armature_obj, binding):
 
 def _apply_index_bound_weights(mesh_obj, armature_obj, binding):
     part_to_bone = binding.get("part_to_bone_map") or {}
+    bone_alias_map = binding.get("bone_alias_map") or {}
     groups = {}
     available_bones = {bone.name for bone in armature_obj.data.bones}
     fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
@@ -2445,6 +2756,7 @@ def _apply_index_bound_weights(mesh_obj, armature_obj, binding):
             part_to_bone,
             available_bones,
             fallback_bone=fallback_bone,
+            bone_alias_map=bone_alias_map,
         )
         if resolved and resolved not in groups:
             groups[resolved] = mesh_obj.vertex_groups.new(name=resolved)
@@ -2460,6 +2772,7 @@ def _apply_index_bound_weights(mesh_obj, armature_obj, binding):
                 part_to_bone,
                 available_bones,
                 fallback_bone=fallback_bone,
+                bone_alias_map=bone_alias_map,
             )
             group = groups.get(resolved)
             if group and weight > 0:
@@ -2476,6 +2789,7 @@ def _apply_index_bound_weights(mesh_obj, armature_obj, binding):
 
 def _apply_uv_map_bound_weights(mesh_obj, armature_obj, binding):
     part_to_bone = binding.get("part_to_bone_map") or {}
+    bone_alias_map = binding.get("bone_alias_map") or {}
     groups = {}
     available_bones = {bone.name for bone in armature_obj.data.bones}
     fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
@@ -2485,6 +2799,7 @@ def _apply_uv_map_bound_weights(mesh_obj, armature_obj, binding):
             part_to_bone,
             available_bones,
             fallback_bone=fallback_bone,
+            bone_alias_map=bone_alias_map,
         )
         if resolved and resolved not in groups:
             groups[resolved] = mesh_obj.vertex_groups.new(name=resolved)
@@ -2516,6 +2831,7 @@ def _apply_uv_map_bound_weights(mesh_obj, armature_obj, binding):
                 part_to_bone,
                 available_bones,
                 fallback_bone=fallback_bone,
+                bone_alias_map=bone_alias_map,
             )
             group = groups.get(resolved)
             if group and weight > 0:
@@ -2653,6 +2969,7 @@ def _refresh_match_context(match_ctx):
         "fingerprint_object_map",
         "intentionally_missing_parts",
         "skinned_mesh_bindings",
+        "skin_bind_matrices",
         "pending_constraints",
     ):
         if key in match_ctx:
@@ -2912,9 +3229,15 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
     bone["transform"] = _matrix_to_idprop(mat)
     t2b = get_transform_to_blender()
     bone_dir = (t2b @ mat).to_3x3().to_4x4() @ Vector((0, 0, 1))
+    roll_dir = bone_dir
 
     # Check if this bone is marked as a deform bone from Studio export
     is_deform_bone = rigsubdef.get("isDeformBone", False)
+    skin_bind_matrix = None
+    if is_deform_bone:
+        skin_bind_matrix = (match_ctx.get("skin_bind_matrices") or {}).get(rigsubdef["jname"])
+        if skin_bind_matrix is not None:
+            bone["rbx_skin_bind_rest"] = _matrix_to_idprop(skin_bind_matrix)
     if joint_type:
         # Preserve joint type for downstream serialization/diagnostics (Motor6D/Weld/WeldConstraint/Bone)
         bone["rbx_joint_type"] = joint_type
@@ -2925,18 +3248,26 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
         bone["rbx_is_deform_bone"] = True
         bone["is_transformable"] = True
         bone.use_deform = True
+    elif match_ctx.get("skinned_mesh_bindings") or match_ctx.get("skin_bind_matrices"):
+        # In a skinned Roblox-Bone rig, non-deform rig nodes are hierarchy/part
+        # helpers. Keep them for metadata, but do not let Blender treat them as
+        # mesh-deforming controls.
+        bone["rbx_helper_bone"] = True
+        bone.use_deform = False
 
     if "jointtransform0" not in rigsubdef:
         # Rig root
-        bone.head = (t2b @ mat).to_translation()
-        bone.tail = (t2b @ mat) @ Vector((0, 0.01, 0))
+        o_trans = t2b @ mat
+        edit_trans = skin_bind_matrix or o_trans
+        roll_dir = edit_trans.to_3x3().to_4x4() @ Vector((0, 0, 1)) if skin_bind_matrix else bone_dir
+        bone.head = edit_trans.to_translation()
+        bone.tail = edit_trans @ Vector((0, 0.01, 0))
         bone["transform0"] = _matrix_to_idprop(Matrix())
         bone["transform1"] = _matrix_to_idprop(Matrix())
         bone["nicetransform"] = _matrix_to_idprop(Matrix())
-        bone.align_roll(bone_dir)
+        bone.align_roll(roll_dir)
         bone.hide_select = True
         pre_mat = bone.matrix
-        o_trans = t2b @ mat
     else:
         mat0 = cf_to_mat(rigsubdef["jointtransform0"])
         mat1 = cf_to_mat(rigsubdef["jointtransform1"])
@@ -2948,19 +3279,21 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
 
         bone.parent = parent_bone
         o_trans = t2b @ (mat @ mat1)
-        bone.head = o_trans.to_translation()
-        real_tail = o_trans @ Vector((0, 0.25, 0))
+        edit_trans = skin_bind_matrix or o_trans
+        roll_dir = edit_trans.to_3x3().to_4x4() @ Vector((0, 0, 1)) if skin_bind_matrix else bone_dir
+        bone.head = edit_trans.to_translation()
+        real_tail = edit_trans @ Vector((0, 0.25, 0))
 
-        neutral_pos = (t2b @ mat).to_translation()
+        neutral_pos = edit_trans.to_translation()
         bone.tail = real_tail
-        bone.align_roll(bone_dir)
+        bone.align_roll(roll_dir)
 
         # Store neutral matrix before any transforms (needed for all modes)
         pre_mat = bone.matrix
 
-        # For RAW (nodes only), use original bone positions without any modifications
-        # This preserves the exact bone structure from the original rig data
-        if rigging_type != "RAW":
+        # For RAW (nodes only), use original bone positions without any modifications.
+        # Skin bind rest overrides are also exact data and should not be made "nice".
+        if rigging_type != "RAW" and skin_bind_matrix is None:
             # For other rigging types, apply "nice" transforms for better visualization/IK
             chain_children = _articulated_chain_children(rigsubdef)
             if len(chain_children) == 1:
@@ -2992,10 +3325,10 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
             if (bone.tail - bone.head).length < 0.01:
                 # just reset, no "nice" config can be found
                 bone.tail = real_tail
-                bone.align_roll(bone_dir)
+                bone.align_roll(roll_dir)
 
     # fix roll
-    bone.align_roll(bone_dir)
+    bone.align_roll(roll_dir)
 
     post_mat = bone.matrix
 
@@ -3071,6 +3404,284 @@ def _get_or_create_weld_bone_shape():
     return shape_obj
 
 
+def _create_mesh_shape_object(shape_name, verts, faces):
+    """Create a hidden mesh object for display-only custom bone shapes."""
+    existing = bpy.data.objects.get(shape_name)
+    if existing is not None:
+        if getattr(existing, "type", None) == "MESH":
+            mesh_data = existing.data
+            try:
+                mesh_data.clear_geometry()
+                mesh_data.from_pydata([tuple(v) for v in verts], [], faces)
+                mesh_data.update()
+                return existing
+            except Exception:
+                pass
+
+        mesh_data = bpy.data.meshes.new(name=f"{shape_name}Mesh")
+        mesh_data.from_pydata([tuple(v) for v in verts], [], faces)
+        mesh_data.update()
+        existing.data = mesh_data
+        return existing
+
+    mesh_data = bpy.data.meshes.new(name=f"{shape_name}Mesh")
+    mesh_data.from_pydata([tuple(v) for v in verts], [], faces)
+    mesh_data.update()
+
+    shape_obj = bpy.data.objects.new(shape_name, mesh_data)
+    shape_obj.hide_viewport = True
+    shape_obj.hide_render = True
+    return shape_obj
+
+
+def _bone_shape_basis(direction):
+    ref = Vector((0, 0, 1))
+    if abs(direction.dot(ref)) > 0.92:
+        ref = Vector((1, 0, 0))
+
+    side_a = direction.cross(ref)
+    if side_a.length < 0.001:
+        side_a = Vector((1, 0, 0))
+    side_a.normalize()
+
+    side_b = direction.cross(side_a)
+    if side_b.length < 0.001:
+        side_b = Vector((0, 0, 1))
+    side_b.normalize()
+    return side_a, side_b
+
+
+def _append_bone_shape_sphere(verts, faces, center, radius, segments=12, rings=6):
+    base = len(verts)
+    verts.append(center + Vector((0, 0, radius)))
+
+    for ring in range(1, rings):
+        theta = math.pi * ring / rings
+        z = math.cos(theta) * radius
+        r = math.sin(theta) * radius
+        for seg in range(segments):
+            phi = math.tau * seg / segments
+            verts.append(center + Vector((math.cos(phi) * r, math.sin(phi) * r, z)))
+
+    bottom_index = len(verts)
+    verts.append(center + Vector((0, 0, -radius)))
+
+    first_ring = base + 1
+    for seg in range(segments):
+        faces.append((base, first_ring + seg, first_ring + ((seg + 1) % segments)))
+
+    for ring in range(rings - 2):
+        row_a = base + 1 + ring * segments
+        row_b = row_a + segments
+        for seg in range(segments):
+            faces.append(
+                (
+                    row_a + seg,
+                    row_b + seg,
+                    row_b + ((seg + 1) % segments),
+                    row_a + ((seg + 1) % segments),
+                )
+            )
+
+    last_ring = base + 1 + (rings - 2) * segments
+    for seg in range(segments):
+        faces.append((bottom_index, last_ring + ((seg + 1) % segments), last_ring + seg))
+
+
+def _append_roblox_bone_shape(verts, faces, start, end, include_start_sphere=False):
+    """Append a display-only Roblox-like bone: round head, pointed tail."""
+    axis = end - start
+    length = axis.length
+    if length < 0.01:
+        return False
+
+    direction = axis.normalized()
+    side_a, side_b = _bone_shape_basis(direction)
+
+    head_radius = min(0.18, max(0.07, length * 0.04))
+    body_radius = min(0.12, max(0.045, length * 0.028))
+    neck_radius = body_radius * 0.58
+    ring_count = 14
+
+    if include_start_sphere:
+        _append_bone_shape_sphere(verts, faces, start, head_radius)
+
+    ring_positions = [
+        start + direction * (head_radius * 0.9),
+        start + direction * max(head_radius * 1.8, length * 0.22),
+        end - direction * min(length * 0.16, max(head_radius * 0.9, 0.12)),
+    ]
+    ring_radii = [body_radius, body_radius, neck_radius]
+
+    ring_indices = []
+    for center, radius in zip(ring_positions, ring_radii):
+        row = []
+        for idx in range(ring_count):
+            angle = math.tau * idx / ring_count
+            pos = center + side_a * (math.cos(angle) * radius) + side_b * (math.sin(angle) * radius)
+            verts.append(pos)
+            row.append(len(verts) - 1)
+        ring_indices.append(row)
+
+    for ring_idx in range(len(ring_indices) - 1):
+        row_a = ring_indices[ring_idx]
+        row_b = ring_indices[ring_idx + 1]
+        for idx in range(ring_count):
+            faces.append(
+                (
+                    row_a[idx],
+                    row_b[idx],
+                    row_b[(idx + 1) % ring_count],
+                    row_a[(idx + 1) % ring_count],
+                )
+            )
+
+    tip_index = len(verts)
+    verts.append(end)
+    last_row = ring_indices[-1]
+    for idx in range(ring_count):
+        faces.append((last_row[idx], tip_index, last_row[(idx + 1) % ring_count]))
+
+    return True
+
+
+def _get_or_create_deform_bone_shape(armature_obj, bone):
+    """Create a display-only Roblox Bone shape without changing bind/rest data."""
+    safe_arm_name = "".join(ch if ch.isalnum() else "_" for ch in armature_obj.name)
+    safe_bone_name = "".join(ch if ch.isalnum() else "_" for ch in bone.name)
+    shape_name = f"__RbxBonePointShape_v3_{safe_arm_name}_{safe_bone_name}"
+
+    verts = []
+    faces = []
+    child_segments = 0
+    bone_inv = bone.matrix_local.inverted()
+    for child in bone.children:
+        child_joint_type = child.get("rbx_joint_type", "Motor6D")
+        if child_joint_type in ("Weld", "WeldConstraint"):
+            continue
+        if not child.get("rbx_is_deform_bone", False):
+            continue
+
+        child_local = bone_inv @ child.matrix_local.to_translation()
+        if child_local.length < 0.01:
+            continue
+
+        if _append_roblox_bone_shape(
+            verts,
+            faces,
+            Vector((0, 0, 0)),
+            child_local,
+            include_start_sphere=(child_segments == 0),
+        ):
+            child_segments += 1
+
+    if child_segments == 0:
+        _append_roblox_bone_shape(
+            verts,
+            faces,
+            Vector((0, 0, 0)),
+            Vector((0, 0.9, 0)),
+            include_start_sphere=True,
+        )
+
+    return _create_mesh_shape_object(shape_name, verts, faces)
+
+
+def _configure_imported_deform_bones(armature_obj):
+    """Use Blender's default bone display for imported Roblox Bones."""
+    _safe_mode_set("POSE", armature_obj)
+
+    for bone in armature_obj.data.bones:
+        if not bone.get("rbx_is_deform_bone", False):
+            continue
+        if bone.get("rbx_face_deform_bone", False):
+            continue
+
+        joint_type = bone.get("rbx_joint_type", "Motor6D")
+        if joint_type in ("Weld", "WeldConstraint"):
+            continue
+
+        pose_bone = armature_obj.pose.bones.get(bone.name)
+        if pose_bone is None:
+            continue
+
+        pose_bone.custom_shape = None
+
+        if hasattr(pose_bone, "color"):
+            pose_bone.color.palette = "CUSTOM"
+            pose_bone.color.custom.normal = (0.45, 0.65, 1.0)
+            pose_bone.color.custom.select = (0.7, 0.9, 1.0)
+            pose_bone.color.custom.active = (1.0, 0.95, 0.45)
+
+    _safe_mode_set("OBJECT", armature_obj)
+
+
+def _is_weld_bone(bone):
+    joint_type = bone.get("rbx_joint_type", "Motor6D")
+    return joint_type in ("Weld", "WeldConstraint")
+
+
+def _is_helper_bone(bone, has_imported_deform_bones=False):
+    if bone.get("rbx_face_deform_bone", False):
+        return False
+    if _is_weld_bone(bone):
+        return True
+    if bone.get("rbx_is_deform_bone", False):
+        return False
+    if bone.get("rbx_helper_bone", False):
+        return True
+    if has_imported_deform_bones and "transform" in bone:
+        return True
+    return not bool(getattr(bone, "use_deform", False))
+
+
+def _set_bone_hidden(bone, hidden):
+    try:
+        bone.hide = hidden
+    except Exception:
+        pass
+
+
+def _get_or_create_bone_collection(amt, collection_name):
+    try:
+        collections = amt.collections
+    except Exception:
+        return None
+
+    bone_coll = collections.get(collection_name)
+    if bone_coll is None:
+        bone_coll = collections.new(collection_name)
+    return bone_coll
+
+
+def _configure_helper_bones(armature_obj):
+    """Group/hide non-deforming helpers without changing the rig data."""
+    amt = armature_obj.data
+    settings = bpy.context.scene.rbx_anim_settings
+    hide_helpers = getattr(settings, "rbx_hide_helper_bones", False)
+    hide_welds = getattr(settings, "rbx_hide_weld_bones", False)
+    has_imported_deform_bones = any(
+        bone.get("rbx_is_deform_bone", False)
+        for bone in amt.bones
+    )
+
+    helper_coll = _get_or_create_bone_collection(amt, "_HelperBones")
+    if helper_coll is not None:
+        helper_coll.is_visible = not hide_helpers
+
+    for bone in amt.bones:
+        if not _is_helper_bone(bone, has_imported_deform_bones):
+            continue
+
+        if helper_coll is not None:
+            try:
+                helper_coll.assign(bone)
+            except Exception:
+                pass
+
+        _set_bone_hidden(bone, hide_helpers or (_is_weld_bone(bone) and hide_welds))
+
+
 def _configure_weld_bones(armature_obj):
     """Configure weld bones: custom shape, lock transforms, gray color."""
     amt = armature_obj.data
@@ -3097,8 +3708,7 @@ def _configure_weld_bones(armature_obj):
             weld_coll = collections.new(weld_coll_name)
     
     for bone in amt.bones:
-        joint_type = bone.get("rbx_joint_type", "Motor6D")
-        if joint_type in ("Weld", "WeldConstraint"):
+        if _is_weld_bone(bone):
             pose_bone = armature_obj.pose.bones.get(bone.name)
             if pose_bone:
                 pose_bone.custom_shape = weld_shape
@@ -3117,8 +3727,7 @@ def _configure_weld_bones(armature_obj):
             
             if use_collections:
                 weld_coll.assign(bone)
-            else:
-                bone.hide = hide_welds
+            _set_bone_hidden(bone, hide_welds)
     
     if use_collections:
         weld_coll.is_visible = not hide_welds
@@ -3217,6 +3826,14 @@ def create_rig(rigging_type, rig_meta_obj_name):
     skinned_mesh_bindings = _prepare_skinned_mesh_bindings(meta_loaded, parts_collection)
     match_ctx["skinned_mesh_bindings"] = skinned_mesh_bindings
     match_ctx = _refresh_match_context(match_ctx)
+    rig_def = meta_loaded.get("rig") or {}
+    rig_names = set(_iter_rig_node_names(rig_def))
+    _rig_deform_bind_matrices, rig_all_bind_matrices = _collect_rig_bind_matrices(rig_def)
+    match_ctx["skin_bind_matrices"] = _collect_skin_bind_rest_matrices(
+        skinned_mesh_bindings,
+        rig_names,
+        rig_bind_matrices=rig_all_bind_matrices,
+    )
 
     bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
     ao = bpy.context.object
@@ -3232,6 +3849,7 @@ def create_rig(rigging_type, rig_meta_obj_name):
     ao.name = get_unique_name(f"__{rig_name}_Armature")
     amt = ao.data
     amt.name = get_unique_name(f"__{rig_name}_RigArm")
+    amt.display_type = "OCTAHEDRAL"
     amt.show_axes = True
     amt.show_names = True
 
@@ -3309,9 +3927,18 @@ def create_rig(rigging_type, rig_meta_obj_name):
     
     # Configure weld bones with custom display and lock them from animation
     _configure_weld_bones(ao)
+    _configure_helper_bones(ao)
+    _configure_imported_deform_bones(ao)
 
     applied_skinning = _apply_skinned_mesh_bindings(ao, skinned_mesh_bindings)
     if applied_skinning:
         print(f"[RigCreate] Applied skinned mesh weights to {applied_skinning} mesh object(s)")
+
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+        ao.select_set(True)
+        bpy.context.view_layer.objects.active = ao
+    except Exception:
+        pass
 
     return {}

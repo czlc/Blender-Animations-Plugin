@@ -55,6 +55,8 @@ from ..rig.creation import (
     _build_wrap_target_snapshot,
     _collect_intentionally_missing_wrap_target_parts,
     _compose_wrap_geometry_matrix,
+    _mesh_bones_overlap_rig,
+    _resolve_binding_bone_name,
 )
 from ..rig.constraints import (
     auto_constraint_parts,
@@ -186,6 +188,18 @@ def _make_rig_node(jname, blender_xyz, children=None, aux=None, aux_transforms=N
     return node
 
 
+def _assert_matrix_close(testcase, actual, expected, places=5):
+    testcase.assertEqual(len(actual), len(expected))
+    for row_idx in range(len(actual)):
+        testcase.assertEqual(len(actual[row_idx]), len(expected[row_idx]))
+        for col_idx in range(len(actual[row_idx])):
+            testcase.assertAlmostEqual(
+                actual[row_idx][col_idx],
+                expected[row_idx][col_idx],
+                places=places,
+            )
+
+
 def _make_meta(rig_name, rig_def, part_aux_list, parts_list=None):
     """Build a minimal meta_loaded dict."""
     meta = {
@@ -224,6 +238,24 @@ class TestSkinnedMeshBindings(unittest.TestCase):
 
     def tearDown(self):
         _cleanup()
+
+    def test_skin_bone_aliases_count_as_rig_overlap(self):
+        self.assertTrue(
+            _mesh_bones_overlap_rig(
+                ["Right Arm"],
+                {"Arm.R"},
+                bone_alias_map={"Right Arm": "Arm.R"},
+            )
+        )
+
+    def test_skin_bone_alias_takes_priority_over_part_name(self):
+        resolved = _resolve_binding_bone_name(
+            "Right Arm",
+            {"Right Arm": "RightArmPart"},
+            {"RightArmPart", "Arm.R"},
+            bone_alias_map={"Right Arm": "Arm.R"},
+        )
+        self.assertEqual(resolved, "Arm.R")
 
     def test_prepare_skinned_mesh_bindings_accepts_part_name_weights_for_wrap_layers(self):
         parts = _make_parts_collection()
@@ -1490,10 +1522,14 @@ class TestAutoConstraintParts(unittest.TestCase):
         ok, msg = auto_constraint_parts(ao.name)
         self.assertTrue(ok)
         torso = self.parts.objects.get("Torso")
-        self.assertTrue(any(
-            c.type == "CHILD_OF" and c.subtarget == "Torso"
-            for c in torso.constraints
-        ))
+        child_ofs = [
+            c for c in torso.constraints
+            if c.type == "CHILD_OF" and c.subtarget == "Torso"
+        ]
+        self.assertEqual(len(child_ofs), 1)
+        bone_rest = ao.data.bones["Torso"].matrix_local.to_4x4()
+        expected_inverse = (ao.matrix_world @ bone_rest).inverted()
+        _assert_matrix_close(self, child_ofs[0].inverse_matrix, expected_inverse)
 
     def test_duplicate_bones_position_disambiguated(self):
         """Two bones with the same base name on opposite sides of the rig.
@@ -1881,6 +1917,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestHungarianAssign))
     suite.addTests(loader.loadTestsFromTestCase(TestTwoPassRename))
     suite.addTests(loader.loadTestsFromTestCase(TestSizeFingerprintMatching))
+    suite.addTests(loader.loadTestsFromTestCase(TestSkinnedMeshBindings))
     suite.addTests(loader.loadTestsFromTestCase(TestAutoConstraintParts))
     suite.addTests(loader.loadTestsFromTestCase(TestFindMatchingPart))
     suite.addTests(loader.loadTestsFromTestCase(TestEndToEndRenamePipeline))

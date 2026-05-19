@@ -7,6 +7,7 @@ existing Roblox rig, with optional bone creation for independent animation.
 
 import bpy
 from bpy_extras.io_utils import ImportHelper
+from ..rig.constraints import set_child_of_bone_inverse
 from ..core.utils import (
     find_master_collection_for_object,
     find_parts_collection_in_master,
@@ -165,10 +166,7 @@ class OBJECT_OT_AttachMeshToBone(bpy.types.Operator):
             # set inverse matrix so the mesh stays at its current position
             # relative to the bone
             bone = armature.data.bones[target_bone_name]
-            bone_mat = bone.matrix_local
-            if hasattr(bone_mat, "to_4x4"):
-                bone_mat = bone_mat.to_4x4()
-            constraint.inverse_matrix = (armature.matrix_world @ bone_mat).inverted()
+            set_child_of_bone_inverse(constraint, armature, bone)
             
             attached.append(obj.name)
         
@@ -261,7 +259,7 @@ class OBJECT_OT_ImportAndAttach(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".obj"
     filter_glob: bpy.props.StringProperty(default="*.obj", options={"HIDDEN"})
-    filepath: bpy.props.StringProperty(name="File Path", maxlen=1024, default="")
+    filepath: bpy.props.StringProperty(name="File Path", maxlen=1024, default="", subtype="FILE_PATH")
 
     @classmethod
     def poll(cls, context):

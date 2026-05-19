@@ -725,6 +725,42 @@ return function()
 				child:Destroy()
 			end)
 
+			it("should encode reversed WeldConstraint offsets relative to traversal parent", function()
+				local parent = Instance.new("Part")
+				parent.Name = "ParentWeldConstraint"
+				parent.CFrame = CFrame.new(10, 0, 0)
+				parent.Parent = workspace
+
+				local child = Instance.new("Part")
+				child.Name = "ChildWeldConstraint"
+				child.CFrame = CFrame.new(13, 2, 0)
+				child.Parent = workspace
+
+				-- reversed: Part0=child, Part1=parent
+				local weld = Instance.new("WeldConstraint")
+				weld.Part0 = child
+				weld.Part1 = parent
+				weld.Parent = parent
+
+				local jc = { [parent] = { weld }, [child] = { weld } }
+				local rig = makeRig(jc)
+				local rp = RigPart.new(rig, parent, nil, false)
+
+				local encoded = rp:Encode({}, { exportWelds = true })
+				local childEncoded = encoded.children[1]
+
+				expect(childEncoded.jointType).to.equal("WeldConstraint")
+				expect(childEncoded.jointtransform0[1]).to.be.near(3, 0.001)
+				expect(childEncoded.jointtransform0[2]).to.be.near(2, 0.001)
+				expect(childEncoded.jointtransform0[3]).to.be.near(0, 0.001)
+				expect(childEncoded.jointtransform1[1]).to.be.near(0, 0.001)
+				expect(childEncoded.jointtransform1[2]).to.be.near(0, 0.001)
+				expect(childEncoded.jointtransform1[3]).to.be.near(0, 0.001)
+
+				parent:Destroy()
+				child:Destroy()
+			end)
+
 			it("should encode AnimationConstraint attachments as parent-relative and child-relative offsets", function()
 				local parent = Instance.new("Part")
 				parent.Name = "ParentAC"
