@@ -67,6 +67,33 @@ local function waitBeforeExportSelectionIfNeeded(root: Instance?)
 	end
 end
 
+local function moveActiveRigToExportOriginIfNeeded(): CFrame?
+	if not State.setRigOrigin:get(true) then
+		return nil
+	end
+
+	local activeRigModel = State.activeRigModel
+	if not activeRigModel or not activeRigModel.PrimaryPart then
+		return nil
+	end
+
+	local originalPivot = activeRigModel:GetPivot()
+	local currentCFrame = (activeRigModel.PrimaryPart :: BasePart).CFrame
+	local newCFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation())
+	local delta = newCFrame * currentCFrame:Inverse()
+	activeRigModel:PivotTo(delta * originalPivot)
+	task.wait()
+	return originalPivot
+end
+
+local function restoreActiveRigPivotIfNeeded(originalPivot: CFrame?)
+	local activeRigModel = State.activeRigModel
+	if activeRigModel and activeRigModel.Parent and originalPivot then
+		activeRigModel:PivotTo(originalPivot)
+		task.wait()
+	end
+end
+
 local function focusCurrentCameraOnRigPrimaryPart()
 	local activeRigModel = State.activeRigModel
 	if not activeRigModel then
@@ -308,6 +335,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 
 	local usedModelNames = {}
 	local partCount = 0
+	local skinnedFingerprintSkips = 0
 
 	-- Iterate the CLONE's descendants.
 	for descIdx, desc in ipairs(rigModelToExport:GetDescendants()) do
@@ -344,7 +372,20 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 			local id = partCount
 			local quantum = 0.0001 -- 1cm steps - must survive FBX precision loss
 
+			local meshSource: MeshPart? = nil
+			local hasSkinning = false
+			if sourceInst:IsA("MeshPart") then
+				meshSource = sourceInst :: MeshPart
+				hasSkinning = meshPartHasSkinning(meshSource)
+			end
+
 			local perturbation = Vector3.one * (id * quantum)
+			if hasSkinning then
+				-- Do not resize skinned meshes for fingerprinting. Roblox's OBJ
+				-- exporter can bake those meshes from the disturbed skin state.
+				perturbation = Vector3.zero
+				skinnedFingerprintSkips += 1
+			end
 			desc.Size = desc.Size + perturbation
 
 			-- Store Expected Dimensions/Volume (use table.insert for proper JSON array serialization)
@@ -357,9 +398,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 				part_cf = { sourceInst.CFrame:GetComponents() },
 			}
 
-			if sourceInst:IsA("MeshPart") then
-				local meshSource = sourceInst :: MeshPart
-				local hasSkinning = meshPartHasSkinning(meshSource)
+			if meshSource then
 				local wrapLayerData = getWrapLayerData(meshSource)
 				local wrapTargetData = getWrapTargetData(meshSource)
 				auxEntry.mesh_class = "MeshPart"
@@ -397,7 +436,11 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 	end
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
-	print(string.format("[ExportManager] generateMetadata: exported %d parts", #partNames))
+	print(string.format(
+		"[ExportManager] generateMetadata: exported %d parts, skipped skinned fingerprints=%d",
+		#partNames,
+		skinnedFingerprintSkips
+	))
 
 	return {
 		rigName = State.activeRig.model.Name,
@@ -419,6 +462,7 @@ function ExportManager:generateMetadataLegacy(
 	local partAuxData = {}
 	local usedModelNames = {}
 	local partCount = 0
+	local skinnedFingerprintSkips = 0
 
 	local primaryClone = rigModelToExport.PrimaryPart
 
@@ -454,7 +498,20 @@ function ExportManager:generateMetadataLegacy(
 			local id = partCount
 			local quantum = 0.0001 -- 1cm steps - must survive FBX precision loss
 
+			local meshSource: MeshPart? = nil
+			local hasSkinning = false
+			if sourceInst:IsA("MeshPart") then
+				meshSource = sourceInst :: MeshPart
+				hasSkinning = meshPartHasSkinning(meshSource)
+			end
+
 			local perturbation = Vector3.one * (id * quantum)
+			if hasSkinning then
+				-- Do not resize skinned meshes for fingerprinting. Roblox's OBJ
+				-- exporter can bake those meshes from the disturbed skin state.
+				perturbation = Vector3.zero
+				skinnedFingerprintSkips += 1
+			end
 			desc.Size = desc.Size + perturbation
 
 			-- use table.insert for proper JSON array serialization
@@ -467,9 +524,7 @@ function ExportManager:generateMetadataLegacy(
 				part_cf = { sourceInst.CFrame:GetComponents() },
 			}
 
-			if sourceInst:IsA("MeshPart") then
-				local meshSource = sourceInst :: MeshPart
-				local hasSkinning = meshPartHasSkinning(meshSource)
+			if meshSource then
 				local wrapLayerData = getWrapLayerData(meshSource)
 				local wrapTargetData = getWrapTargetData(meshSource)
 				auxEntry.mesh_class = "MeshPart"
@@ -497,7 +552,11 @@ function ExportManager:generateMetadataLegacy(
 	end
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
-	print(string.format("[ExportManager] generateMetadataLegacy: exported %d parts", partCount))
+	print(string.format(
+		"[ExportManager] generateMetadataLegacy: exported %d parts, skipped skinned fingerprints=%d",
+		partCount,
+		skinnedFingerprintSkips
+	))
 
 	-- print("[ExportManager] Exporting Legacy with skinned mesh + wrap metadata (v1.5)")
 
@@ -517,12 +576,7 @@ function ExportManager:exportRig()
 
 	---- Clone the rig model, then rename all baseparts to the rig name (let the export flow handle unique indices)
 	--print(activeRig)
-	if State.setRigOrigin:get(true) then
-		local currentCFrame = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
-		local newCFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation());
-		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
-		task.wait()
-	end
+	local originalActiveRigPivot = moveActiveRigToExportOriginIfNeeded()
 
 	local function buildArchivablePathMap(root: Instance)
 		local map = {}
@@ -563,6 +617,7 @@ function ExportManager:exportRig()
 
 	if not rigModelToExport then
 		warn("[ExportManager] Failed to clone ActiveRig (Clone returned nil).")
+		restoreActiveRigPivotIfNeeded(originalActiveRigPivot)
 		return
 	end
 
@@ -574,6 +629,7 @@ function ExportManager:exportRig()
 	State.metaParts = { rigModelToExport }
 
 	local meta = self:generateMetadata(rigModelToExport, originalMap)
+	restoreActiveRigPivotIfNeeded(originalActiveRigPivot)
 	if not meta then
 		return
 	end
@@ -1261,13 +1317,7 @@ function ExportManager:exportRigLegacy()
 
 	-- Clone the rig model, then rename all baseparts to the rig name (let the export flow handle unique indices)
 	--print(activeRig)
-	if State.setRigOrigin:get(true) then
-		local currentCFrame = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
-		local newCFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation());
-		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
-		-- Yield so physics propagates CFrame to welded descendants before cloning
-		task.wait()
-	end
+	local originalActiveRigPivot = moveActiveRigToExportOriginIfNeeded()
 
 	local function buildArchivablePathMap(root: Instance)
 		local map = {}
@@ -1308,6 +1358,7 @@ function ExportManager:exportRigLegacy()
 
 	if not rigModelToExport then
 		warn("[ExportManager] Failed to clone ActiveRig (Clone returned nil).")
+		restoreActiveRigPivotIfNeeded(originalActiveRigPivot)
 		return
 	end
 
@@ -1319,6 +1370,7 @@ function ExportManager:exportRigLegacy()
 	State.metaParts = { rigModelToExport }
 
 	local meta = self:generateMetadataLegacy(rigModelToExport, originalMap)
+	restoreActiveRigPivotIfNeeded(originalActiveRigPivot)
 	if not meta then
 		return
 	end

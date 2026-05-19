@@ -6,6 +6,7 @@ import json
 import base64
 import re
 import bpy
+from pathlib import Path
 from bpy_extras.io_utils import ImportHelper
 from ..core.utils import get_unique_name, get_object_by_name, iter_scene_objects
 from ..core.utils import cf_to_mat, mat_to_cf
@@ -36,6 +37,81 @@ def _ensure_all_bone_collections_visible(armature):
 
 def _strip_suffix(name: str) -> str:
     return re.sub(r"\.\d+$", "", name or "")
+
+
+def _iter_obj_mtllib_paths(obj_filepath):
+    obj_path = Path(obj_filepath)
+    try:
+        lines = obj_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return []
+
+    mtl_paths = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line.lower().startswith("mtllib "):
+            continue
+        mtl_name = line[7:].strip()
+        if mtl_name:
+            mtl_paths.append((obj_path.parent / mtl_name).resolve())
+    return mtl_paths
+
+
+def _normalize_mtl_map_ka_for_blender(obj_filepath):
+    """Roblox OBJ export can put diffuse textures in map_Ka, which Blender ignores."""
+    for mtl_path in _iter_obj_mtllib_paths(obj_filepath):
+        if not mtl_path.exists():
+            continue
+
+        try:
+            text = mtl_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        lines = text.splitlines()
+        out = []
+        pending_ka_payloads = []
+        material_has_kd = False
+        changed = False
+
+        def flush_pending_ka():
+            nonlocal changed, pending_ka_payloads
+            if pending_ka_payloads and not material_has_kd:
+                for payload in pending_ka_payloads:
+                    out.append(f"map_Kd {payload}")
+                    changed = True
+            pending_ka_payloads = []
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            lower_line = line.lower()
+            if lower_line.startswith("newmtl "):
+                flush_pending_ka()
+                material_has_kd = False
+
+            if lower_line.startswith("map_kd "):
+                material_has_kd = True
+
+            if lower_line.startswith("map_ka "):
+                parts = line.split(None, 1)
+                if len(parts) == 2 and parts[1]:
+                    pending_ka_payloads.append(parts[1])
+                out.append(f"# {raw_line}")
+                changed = True
+                continue
+
+            out.append(raw_line)
+
+        flush_pending_ka()
+
+        if changed:
+            newline = "\r\n" if "\r\n" in text else "\n"
+            trailing_newline = newline if text.endswith(("\n", "\r\n")) else ""
+            try:
+                mtl_path.write_text(newline.join(out) + trailing_newline, encoding="utf-8")
+                print(f"[RigImport] normalized Blender MTL map_Ka -> map_Kd in '{mtl_path.name}'")
+            except Exception as exc:
+                print(f"[RigImport] failed to normalize MTL '{mtl_path.name}': {exc}")
 
 
 def _resolve_imported_obj_name(name: str, known_names=None) -> str:
@@ -2093,23 +2169,26 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
     filepath: bpy.props.StringProperty(name="File Path", maxlen=1024, default="", subtype="FILE_PATH")
 
     def execute(self, context):
+        import_filepath = self.properties.filepath
+        _normalize_mtl_map_ka_for_blender(import_filepath)
+
         # Do not clear objects
         objnames_before_import = {obj.name for obj in iter_scene_objects(context.scene)}
         if bpy.app.version >= (5, 0, 0):
             bpy.ops.wm.obj_import(
-                filepath=self.properties.filepath,
+                filepath=import_filepath,
                 use_split_groups=True,
                 forward_axis="NEGATIVE_Z",
                 up_axis="Y",
             )
         elif bpy.app.version >= (4, 0, 0):
             bpy.ops.wm.obj_import(
-                filepath=self.properties.filepath,
+                filepath=import_filepath,
                 use_split_groups=True,
             )
         else:
             bpy.ops.import_scene.obj(
-                filepath=self.properties.filepath, use_split_groups=True
+                filepath=import_filepath, use_split_groups=True
             )
 
         # Get the actual newly imported OBJECTS

@@ -574,7 +574,11 @@ def _collect_skin_bind_rest_matrices(bindings, rig_names, rig_bind_matrices=None
         return {}
 
     samples = {}
+    posed_geometry_binding_count = 0
     for binding in bindings.values():
+        if binding.get("posed_geometry_baked"):
+            posed_geometry_binding_count += 1
+            continue
         mesh_data = binding.get("mesh_data") or {}
         for record in mesh_data.get("bones") or []:
             resolved_name = _resolve_filemesh_record_bone_name(binding, record)
@@ -586,11 +590,30 @@ def _collect_skin_bind_rest_matrices(bindings, rig_names, rig_bind_matrices=None
                 continue
             samples.setdefault(resolved_name, []).append(matrix)
 
-    result = {}
     spread_warnings = []
+    dominant_cluster_warnings = []
+
+    def choose_dominant_matrix(matrices):
+        clusters = []
+        for matrix in matrices:
+            placed = False
+            for cluster in clusters:
+                base = cluster[0]
+                pos_spread = (matrix.to_translation() - base.to_translation()).length
+                rot_spread = _matrix_rotation_difference(matrix, base)
+                if pos_spread <= 0.05 and rot_spread <= 0.05:
+                    cluster.append(matrix)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([matrix])
+
+        clusters.sort(key=len, reverse=True)
+        return clusters[0][0].copy(), len(clusters[0]), len(clusters)
+
+    result = {}
     for bone_name, matrices in samples.items():
         base = matrices[0].copy()
-        result[bone_name] = base
 
         max_pos_spread = 0.0
         max_rot_spread = 0.0
@@ -602,6 +625,12 @@ def _collect_skin_bind_rest_matrices(bindings, rig_names, rig_bind_matrices=None
             max_rot_spread = max(max_rot_spread, _matrix_rotation_difference(matrix, base))
         if max_pos_spread > 0.02 or max_rot_spread > 0.05:
             spread_warnings.append((bone_name, len(matrices), max_pos_spread, max_rot_spread))
+            chosen, dominant_count, cluster_count = choose_dominant_matrix(matrices)
+            result[bone_name] = chosen
+            if cluster_count > 1:
+                dominant_cluster_warnings.append((bone_name, dominant_count, len(matrices), cluster_count))
+        else:
+            result[bone_name] = base
 
     if result:
         deltas = []
@@ -619,6 +648,16 @@ def _collect_skin_bind_rest_matrices(bindings, rig_names, rig_bind_matrices=None
         print(
             f"[RigCreate] WARNING: skin bind samples for bone '{bone_name}' disagree "
             f"(samples={count}, pos_spread={pos_spread:.5f}, rot_spread={rot_spread:.5f})"
+        )
+    for bone_name, dominant_count, count, cluster_count in dominant_cluster_warnings[:10]:
+        print(
+            f"[RigCreate] Using dominant FileMesh bind cluster for bone '{bone_name}' "
+            f"({dominant_count}/{count} samples, clusters={cluster_count})"
+        )
+    if posed_geometry_binding_count:
+        print(
+            f"[RigCreate] Posed FileMesh geometry used for {posed_geometry_binding_count} binding(s); "
+            "using exported rig pose for those bones"
         )
 
     return result
@@ -1164,14 +1203,7 @@ def _collapse_weighted_source_geometry(vertices, vertex_weights, faces, precisio
     return collapsed_vertices, collapsed_weights, collapsed_faces, representative_original_indices
 
 
-def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, entry, local_cf=None):
-    vertices, faces = _build_transformed_filemesh_geometry(
-        mesh_data,
-        part_cf=entry.get("part_cf"),
-        part_size=entry.get("part_size"),
-        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
-        local_cf=local_cf,
-    )
+def _create_mesh_object_from_vertices(parts_collection, part_name, mesh_data, entry, vertices, faces, *, posed=False):
     if not vertices:
         return None
 
@@ -1192,10 +1224,26 @@ def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, en
     object_name = part_name or get_unique_name("Part")
     mesh_obj = bpy.data.objects.new(object_name, mesh)
     mesh_obj["RBXSynthesizedPart"] = True
+    if posed:
+        mesh_obj["RBXPosedFileMesh"] = True
     _configure_synthesized_mesh_surface(mesh_obj, vertices)
     _configure_synthesized_mesh_display(mesh_obj, entry)
     parts_collection.objects.link(mesh_obj)
     return mesh_obj
+
+
+def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, entry, local_cf=None):
+    vertices, faces = _build_transformed_filemesh_geometry(
+        mesh_data,
+        part_cf=entry.get("part_cf"),
+        part_size=entry.get("part_size"),
+        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
+        local_cf=local_cf,
+    )
+    if not vertices:
+        return None
+
+    return _create_mesh_object_from_vertices(parts_collection, part_name, mesh_data, entry, vertices, faces)
 
 
 def _replace_object_with_synthesized_filemesh(parts_collection, mesh_obj, mesh_data, entry):
@@ -1207,6 +1255,136 @@ def _replace_object_with_synthesized_filemesh(parts_collection, mesh_obj, mesh_d
     replacement = _create_mesh_object_from_filemesh(parts_collection, object_name, mesh_data, entry)
     if replacement is not None:
         print(f"[RigCreate] Replaced imported mesh '{object_name}' with synthesized FileMesh geometry")
+    return replacement
+
+
+def _build_posed_filemesh_geometry(binding, rig_pose_matrices):
+    entry = binding.get("entry") or {}
+    mesh_data = binding.get("mesh_data") or {}
+    vertices, faces = _build_transformed_filemesh_geometry(
+        mesh_data,
+        part_cf=entry.get("part_cf"),
+        part_size=entry.get("part_size"),
+        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
+    )
+    if not vertices or not faces:
+        return None, []
+
+    part_to_bone = binding.get("part_to_bone_map") or {}
+    bone_alias_map = binding.get("bone_alias_map") or {}
+    available_bones = set((rig_pose_matrices or {}).keys())
+    fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
+
+    filemesh_bind_matrices = {}
+    for record in mesh_data.get("bones") or []:
+        resolved = _resolve_filemesh_record_bone_name(binding, record)
+        if not resolved:
+            continue
+        matrix = _build_filemesh_bone_world_matrix(binding, record)
+        if matrix is not None:
+            filemesh_bind_matrices[resolved] = matrix
+
+    vertex_weights = mesh_data.get("vertex_weights") or []
+    if not vertex_weights or not filemesh_bind_matrices:
+        return None, []
+
+    posed_vertices = []
+    max_delta = 0.0
+    total_delta = 0.0
+    posed_count = 0
+
+    for vertex_index, vertex in enumerate(vertices):
+        source_position = Vector(vertex["position"])
+        source_normal = vertex.get("normal")
+        weights = vertex_weights[vertex_index] if vertex_index < len(vertex_weights) else None
+        if not weights:
+            posed_vertices.append(dict(vertex))
+            continue
+
+        accum = Vector((0.0, 0.0, 0.0))
+        normal_accum = Vector((0.0, 0.0, 0.0))
+        total_weight = 0.0
+        for bone_name, weight_value in weights.items():
+            weight = float(weight_value)
+            if weight <= 0.0:
+                continue
+            resolved = _resolve_binding_bone_name(
+                bone_name,
+                part_to_bone,
+                available_bones,
+                fallback_bone=fallback_bone,
+                bone_alias_map=bone_alias_map,
+            )
+            if not resolved:
+                continue
+            pose_matrix = (rig_pose_matrices or {}).get(resolved)
+            bind_matrix = filemesh_bind_matrices.get(resolved)
+            if pose_matrix is None or bind_matrix is None:
+                continue
+
+            delta_matrix = pose_matrix @ bind_matrix.inverted_safe()
+            accum += (delta_matrix @ source_position) * weight
+            if source_normal is not None:
+                normal_accum += (delta_matrix.to_3x3() @ source_normal) * weight
+            total_weight += weight
+
+        if total_weight <= 0.0:
+            posed_vertices.append(dict(vertex))
+            continue
+
+        posed_position = accum / total_weight
+        posed_vertex = dict(vertex)
+        posed_vertex["position"] = posed_position
+        if source_normal is not None and normal_accum.length_squared > 0.0:
+            normal_accum.normalize()
+            posed_vertex["normal"] = normal_accum
+        posed_vertices.append(posed_vertex)
+
+        delta = (posed_position - source_position).length
+        max_delta = max(max_delta, delta)
+        total_delta += delta
+        posed_count += 1
+
+    if posed_count > 0:
+        binding["posed_geometry_avg_delta"] = total_delta / posed_count
+        binding["posed_geometry_max_delta"] = max_delta
+
+    return posed_vertices, faces
+
+
+def _replace_object_with_posed_filemesh(parts_collection, mesh_obj, binding, rig_pose_matrices):
+    if mesh_obj is None:
+        return None
+
+    vertices, faces = _build_posed_filemesh_geometry(binding, rig_pose_matrices)
+    if not vertices:
+        return None
+
+    object_name = mesh_obj.name
+    mesh_data = binding.get("mesh_data") or {}
+    entry = binding.get("entry") or {}
+    materials = list(getattr(mesh_obj.data, "materials", []) or []) if getattr(mesh_obj, "data", None) else []
+    _remove_object_and_data(mesh_obj)
+    replacement = _create_mesh_object_from_vertices(
+        parts_collection,
+        object_name,
+        mesh_data,
+        entry,
+        vertices,
+        faces,
+        posed=True,
+    )
+    if replacement is None:
+        return None
+
+    for material in materials:
+        replacement.data.materials.append(material)
+
+    print(
+        f"[RigCreate] Replaced imported mesh '{object_name}' with posed FileMesh geometry "
+        f"(avg_delta={binding.get('posed_geometry_avg_delta', 0.0):.5f}, "
+        f"max_delta={binding.get('posed_geometry_max_delta', 0.0):.5f})"
+    )
     return replacement
 
 
@@ -1875,6 +2053,8 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
         wrap_layer_metadata = _get_wrap_layer_metadata(entry)
         wrap_target_metadata = _get_wrap_target_metadata(entry)
         auto_skin = _normalize_wrap_auto_skin(wrap_layer_metadata.get("auto_skin")) if wrap_layer_metadata else None
+        if entry.get("has_skinning") is False and not wrap_layer_metadata:
+            continue
 
         binding = {
             "object": mesh_obj,
@@ -1919,10 +2099,32 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
                 _log_lod_bind_selection(mesh_obj, mesh_data, binding_mesh_data)
             _log_binding_inspect(mesh_obj, binding, has_weights, bone_overlap)
             if has_weights and bone_overlap:
-                direct_binding, direct_mode_message = _build_direct_skin_binding(
-                    binding,
-                    prefer_source_uv=bool(wrap_layer_metadata),
-                )
+                if entry.get("has_skinning") and not wrap_layer_metadata:
+                    replacement = _replace_object_with_posed_filemesh(
+                        parts_collection,
+                        mesh_obj,
+                        binding,
+                        rig_all_bind_matrices,
+                    )
+                    if replacement is not None:
+                        mesh_obj = replacement
+                        binding["object"] = mesh_obj
+                        binding["posed_geometry_baked"] = True
+                        direct_binding = {
+                            "mesh_data": binding_mesh_data,
+                            "mode": "index",
+                        }
+                        direct_mode_message = (
+                            "posed FileMesh bake "
+                            f"(avg_delta={binding.get('posed_geometry_avg_delta', 0.0):.6f}, "
+                            f"max_delta={binding.get('posed_geometry_max_delta', 0.0):.6f})"
+                        )
+
+                if direct_binding is None:
+                    direct_binding, direct_mode_message = _build_direct_skin_binding(
+                        binding,
+                        prefer_source_uv=bool(wrap_layer_metadata),
+                    )
 
                 # Imported OBJ meshes for wrap layers can carry the right part name
                 # while still being the wrong render mesh. If the deterministic direct
