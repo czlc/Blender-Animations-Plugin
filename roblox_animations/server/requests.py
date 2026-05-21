@@ -52,6 +52,321 @@ def _get_reported_bone_parent_name(bone):
     return None
 
 
+MRXEN0_R15_RIG_ID = "xqpb4vnl0zay"
+MRXEN0_IMPORT_DEBUG_REV = "fk_head_control_probe_20260521"
+
+MRXEN0_R15_FK_BONE_CANDIDATES = {
+    "LowerTorso": ("LowTorso", "LowerTorso", "TORSO", "BODY", "ROOT"),
+    "UpperTorso": ("UpTorso", "UpperTorso", "TORSO", "BODY", "Chest"),
+    "Head": ("FK_Head", "HEAD", "Head"),
+    "LeftUpperArm": ("FK_UpperArm.L", "LeftUpperArm"),
+    "LeftLowerArm": ("FK_LowerArm.L", "LeftLowerArm"),
+    "LeftHand": ("FK_Hand.L", "LeftHand"),
+    "RightUpperArm": ("FK_UpperArm.R", "RightUpperArm"),
+    "RightLowerArm": ("FK_LowerArm.R", "RightLowerArm"),
+    "RightHand": ("FK_Hand.R", "RightHand"),
+    "LeftUpperLeg": ("FK_UpperLeg.L", "LeftUpperLeg"),
+    "LeftLowerLeg": ("FK_LowerLeg.L", "LeftLowerLeg"),
+    "LeftFoot": ("FK_Foot.L", "LeftFoot"),
+    "RightUpperLeg": ("FK_UpperLeg.R", "RightUpperLeg"),
+    "RightLowerLeg": ("FK_LowerLeg.R", "RightLowerLeg"),
+    "RightFoot": ("FK_Foot.R", "RightFoot"),
+}
+
+MRXEN0_R15_FK_PROPS = (
+    "ARM_IK_FK.L",
+    "ARM_IK_FK.R",
+    "LEG_IK_FK.L",
+    "LEG_IK_FK.R",
+)
+
+MRXEN0_R15_IMPORT_PROPS = (
+    ("HEAD_FOLLOW", 1.0),
+)
+
+MRXEN0_R15_PARENT = {
+    "UpperTorso": "LowerTorso",
+    "Head": "UpperTorso",
+    "LeftUpperArm": "UpperTorso",
+    "LeftLowerArm": "LeftUpperArm",
+    "LeftHand": "LeftLowerArm",
+    "RightUpperArm": "UpperTorso",
+    "RightLowerArm": "RightUpperArm",
+    "RightHand": "RightLowerArm",
+    "LeftUpperLeg": "LowerTorso",
+    "LeftLowerLeg": "LeftUpperLeg",
+    "LeftFoot": "LeftLowerLeg",
+    "RightUpperLeg": "LowerTorso",
+    "RightLowerLeg": "RightUpperLeg",
+    "RightFoot": "RightLowerLeg",
+}
+
+MRXEN0_R15_LIMB_SOURCES = {
+    "LeftUpperArm",
+    "LeftLowerArm",
+    "LeftHand",
+    "RightUpperArm",
+    "RightLowerArm",
+    "RightHand",
+    "LeftUpperLeg",
+    "LeftLowerLeg",
+    "LeftFoot",
+    "RightUpperLeg",
+    "RightLowerLeg",
+    "RightFoot",
+}
+
+def _is_mrxen0_r15_rig(ao):
+    if not ao or ao.type != "ARMATURE" or not getattr(ao, "data", None):
+        return False
+    if ao.data.get("rig_id") == MRXEN0_R15_RIG_ID:
+        return True
+    bone_names = {bone.name for bone in ao.data.bones}
+    required = {
+        "PROPERTIES",
+        "FK_UpperArm.L",
+        "FK_LowerArm.L",
+        "FK_Hand.L",
+        "FK_UpperArm.R",
+        "FK_LowerArm.R",
+        "FK_Hand.R",
+        "FK_UpperLeg.L",
+        "FK_LowerLeg.L",
+        "FK_Foot.L",
+        "FK_UpperLeg.R",
+        "FK_LowerLeg.R",
+        "FK_Foot.R",
+    }
+    return required.issubset(bone_names)
+
+
+def _mrxen0_fk_target_name(ao, roblox_bone_name):
+    for candidate in MRXEN0_R15_FK_BONE_CANDIDATES.get(roblox_bone_name, ()):
+        if candidate in ao.pose.bones:
+            return candidate
+    return None
+
+
+def _mrxen0_body_like_bone_names(ao):
+    tokens = (
+        "torso",
+        "body",
+        "root",
+        "hip",
+        "hips",
+        "chest",
+        "spine",
+        "waist",
+        "pelvis",
+        "cog",
+        "com",
+    )
+    return sorted(
+        bone.name
+        for bone in ao.pose.bones
+        if any(token in bone.name.lower() for token in tokens)
+    )
+
+
+def _mrxen0_head_like_bone_names(ao):
+    tokens = ("head", "neck")
+    return sorted(
+        bone.name
+        for bone in ao.pose.bones
+        if any(token in bone.name.lower() for token in tokens)
+    )
+
+
+def _mrxen0_source_depth(source_name):
+    depth = 0
+    parent = MRXEN0_R15_PARENT.get(source_name)
+    seen = set()
+    while parent and parent not in seen:
+        seen.add(parent)
+        depth += 1
+        parent = MRXEN0_R15_PARENT.get(parent)
+    return depth
+
+
+def _mrxen0_matrix_error(expected_matrix, actual_matrix):
+    delta = expected_matrix @ actual_matrix.inverted()
+    loc_error = delta.to_translation().length
+    rot_error_deg = delta.to_quaternion().angle * 57.29577951308232
+    return loc_error, rot_error_deg
+
+
+def _pose_local_rest_matrix(pose_bone):
+    if pose_bone.parent:
+        return pose_bone.parent.bone.matrix_local.inverted() @ pose_bone.bone.matrix_local
+    return pose_bone.bone.matrix_local.copy()
+
+
+def _apply_local_delta_to_pose_bone(pose_bone, local_delta):
+    local_rest = _pose_local_rest_matrix(pose_bone)
+    if pose_bone.parent:
+        pose_bone.matrix = pose_bone.parent.matrix @ (local_rest @ local_delta)
+    else:
+        pose_bone.matrix = local_rest @ local_delta
+
+
+def _copy_rotation_with_translation(rotation_matrix, translation_matrix):
+    matrix = rotation_matrix.to_3x3().to_4x4()
+    matrix.translation = translation_matrix.to_translation()
+    return matrix
+
+
+def _mrxen0_virtual_source_rest_matrix(ao, source_bone_name):
+    source_bone = ao.pose.bones.get(source_bone_name)
+    if not source_bone:
+        return None
+
+    actual_rest = source_bone.bone.matrix_local.copy()
+    if source_bone_name not in MRXEN0_R15_LIMB_SOURCES:
+        return actual_rest
+
+    if "Arm" in source_bone_name or "Hand" in source_bone_name:
+        frame_source_name = "UpperTorso"
+    else:
+        frame_source_name = "LowerTorso"
+
+    frame_source_bone = ao.pose.bones.get(frame_source_name)
+    if not frame_source_bone:
+        return actual_rest
+
+    # Roblox KeyFrameSequence pose CFrames are authored in body-part space.
+    # MrXen0's limb bones are oriented along the drawn bone chain, so use the
+    # torso part frame rotation plus each limb bone's rest position as a virtual
+    # Roblox part frame before mapping back to the rig's actual FK controls.
+    return _copy_rotation_with_translation(
+        frame_source_bone.bone.matrix_local,
+        actual_rest,
+    )
+
+
+def _apply_source_delta_to_mrxen0_control(
+    ao,
+    source_bone_name,
+    target_bone_name,
+    local_delta,
+    source_pose_matrices,
+):
+    source_bone = ao.pose.bones.get(source_bone_name)
+    target_bone = ao.pose.bones.get(target_bone_name)
+    if not target_bone:
+        return None
+
+    actual_source_rest = (
+        source_bone.bone.matrix_local.copy()
+        if source_bone
+        else target_bone.bone.matrix_local.copy()
+    )
+    source_rest = (
+        _mrxen0_virtual_source_rest_matrix(ao, source_bone_name)
+        or actual_source_rest.copy()
+    )
+    target_rest = target_bone.bone.matrix_local.copy()
+
+    # MrXen0 FK controls do not share the same local space as Roblox Pose bones.
+    # First reconstruct the desired Roblox source bone object-space pose through
+    # the source hierarchy, then carry over the rest-pose offset to the FK
+    # control, mirroring the rig's snap operators.
+    parent_source_name = MRXEN0_R15_PARENT.get(source_bone_name)
+    parent_source_bone = (
+        ao.pose.bones.get(parent_source_name) if parent_source_name else None
+    )
+    parent_pose_matrix = source_pose_matrices.get(parent_source_name)
+    parent_source_rest = (
+        _mrxen0_virtual_source_rest_matrix(ao, parent_source_name)
+        if parent_source_name
+        else None
+    )
+
+    if parent_source_bone and parent_pose_matrix is not None and parent_source_rest:
+        local_rest = parent_source_rest.inverted() @ source_rest
+        source_pose_matrix = parent_pose_matrix @ local_rest @ local_delta
+    else:
+        source_pose_matrix = source_rest @ local_delta
+
+    source_pose_matrices[source_bone_name] = source_pose_matrix
+    desired_source_matrix = (
+        source_pose_matrix @ source_rest.inverted() @ actual_source_rest
+    )
+    target_bone.matrix = (
+        desired_source_matrix @ actual_source_rest.inverted() @ target_rest
+    )
+
+    if source_bone and source_bone is not target_bone:
+        for _ in range(3):
+            bpy.context.view_layer.update()
+            actual_source_matrix = source_bone.matrix.copy()
+            try:
+                correction = desired_source_matrix @ actual_source_matrix.inverted()
+            except Exception:
+                break
+
+            loc_error = correction.to_translation().length
+            rot_error = correction.to_quaternion().angle
+            if loc_error < 0.0001 and rot_error < 0.0001:
+                break
+
+            target_bone.matrix = correction @ target_bone.matrix
+
+    return desired_source_matrix
+
+
+def _set_mrxen0_fk_mode(ao, frame=None, value=None):
+    properties = ao.pose.bones.get("PROPERTIES")
+    if not properties:
+        return []
+
+    if value is None:
+        value = 0.0
+
+    changed = []
+    for prop_name in MRXEN0_R15_FK_PROPS:
+        if prop_name in properties:
+            properties[prop_name] = float(value)
+            changed.append(f"{prop_name}={float(value):.0f}")
+            if frame is not None:
+                try:
+                    properties.keyframe_insert(data_path=f'["{prop_name}"]', frame=frame)
+                except Exception:
+                    pass
+
+    for prop_name, prop_value in MRXEN0_R15_IMPORT_PROPS:
+        if prop_name in properties:
+            properties[prop_name] = float(prop_value)
+            changed.append(f"{prop_name}={float(prop_value):.0f}")
+            if frame is not None:
+                try:
+                    properties.keyframe_insert(data_path=f'["{prop_name}"]', frame=frame)
+                except Exception:
+                    pass
+
+    bpy.context.view_layer.update()
+    return changed
+
+
+def _extract_pose_cframe(pose_data):
+    easing_style = "Linear"
+    easing_direction = "In"
+
+    if isinstance(pose_data, list) and len(pose_data) == 3:
+        cframe_components = pose_data[0]
+        easing_style = pose_data[1]
+        easing_direction = pose_data[2]
+    elif isinstance(pose_data, dict):
+        cframe_components = pose_data.get("components", [])
+        easing_style = pose_data.get("easingStyle", "Linear")
+        easing_direction = pose_data.get("easingDirection", "In")
+    elif isinstance(pose_data, list):
+        cframe_components = pose_data
+    else:
+        cframe_components = []
+
+    return cframe_components, easing_style, easing_direction
+
+
 def process_pending_requests():
     """Process any pending animation requests"""
     try:
@@ -264,9 +579,15 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
         if ao.mode != "POSE":
             bpy.ops.object.mode_set(mode="POSE")
 
+        use_mrxen0_fk_import = _is_mrxen0_r15_rig(ao)
+
         def _do_import():
-            # Clear existing animation data
-            if ao.animation_data:
+            # Clear existing action data. Do not clear animation_data on rigs that
+            # depend on drivers for FK/IK constraints; animation_data_clear()
+            # removes those drivers and leaves controls moving without the model.
+            if ao.animation_data and use_mrxen0_fk_import:
+                ao.animation_data.action = None
+            elif ao.animation_data:
                 ao.animation_data_clear()
 
             # Reset pose to rest position to ensure a clean slate
@@ -307,10 +628,81 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
             scene.frame_end = int(animation_data["t"] * fps)
 
             is_deform_rig = animation_data.get("is_deform_bone_rig", False)
+            incoming_bone_names = {
+                bone_name
+                for kf_data in animation_data.get("kfs", [])
+                for bone_name in (kf_data.get("kf") or {}).keys()
+            }
+            mrxen0_source_to_target = {}
+            mrxen0_unmapped_sources = set()
+            if use_mrxen0_fk_import:
+                for source_name in incoming_bone_names:
+                    target_name = _mrxen0_fk_target_name(ao, source_name)
+                    if target_name:
+                        mrxen0_source_to_target[source_name] = target_name
+                    else:
+                        mrxen0_unmapped_sources.add(source_name)
+
+                print(
+                    "Blender Addon: MrXen0 R15 rig detected; importing Roblox R15 "
+                    "motion to FK controls. "
+                    f"rev={MRXEN0_IMPORT_DEBUG_REV}"
+                )
+                print(
+                    "Blender Addon: MrXen0 FK map "
+                    f"{len(mrxen0_source_to_target)}/{len(incoming_bone_names)} source bones."
+                )
+                body_like_bones = _mrxen0_body_like_bone_names(ao)
+                if body_like_bones:
+                    print(
+                        "Blender Addon: MrXen0 body-like bones: "
+                        + ", ".join(body_like_bones[:80])
+                    )
+                    if len(body_like_bones) > 80:
+                        print(
+                            "Blender Addon: MrXen0 body-like bones truncated, "
+                            f"total={len(body_like_bones)}"
+                        )
+                head_like_bones = _mrxen0_head_like_bone_names(ao)
+                if head_like_bones:
+                    print(
+                        "Blender Addon: MrXen0 head-like bones: "
+                        + ", ".join(head_like_bones[:80])
+                    )
+                if mrxen0_unmapped_sources:
+                    print(
+                        "Blender Addon: MrXen0 unmapped source bones: "
+                        + ", ".join(sorted(mrxen0_unmapped_sources))
+                    )
+                for source_name in sorted(mrxen0_source_to_target):
+                    print(
+                        "Blender Addon: MrXen0 map "
+                        f"{source_name} -> FK {mrxen0_source_to_target[source_name]}"
+                    )
+                lower_target = mrxen0_source_to_target.get("LowerTorso")
+                upper_target = mrxen0_source_to_target.get("UpperTorso")
+                if lower_target and upper_target and lower_target == upper_target:
+                    print(
+                        "Blender Addon: MrXen0 WARNING LowerTorso and UpperTorso map "
+                        f"to the same control '{lower_target}'. Torso motion may be approximate."
+                    )
 
             # This will store all transform data for all bones across all frames before we create any keyframes.
             # Format: { bone_name: { frame: {"location": Vector, "rotation": Quaternion, "scale": Vector}, ... }, ... }
             all_bone_data = {}
+            mrxen0_verify_sample_frames = set()
+            mrxen0_verify_errors = []
+            if use_mrxen0_fk_import:
+                imported_frames = sorted(
+                    {
+                        int(kf_data["t"] * fps)
+                        for kf_data in animation_data.get("kfs", [])
+                    }
+                )
+                if imported_frames:
+                    mrxen0_verify_sample_frames.add(imported_frames[0])
+                    mrxen0_verify_sample_frames.add(imported_frames[len(imported_frames) // 2])
+                    mrxen0_verify_sample_frames.add(imported_frames[-1])
 
             # Reset pose to rest position and pre-populate all transformable bones
             # with their rest pose at the start frame. This ensures a defined initial state.
@@ -320,14 +712,27 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 bpy.context.view_layer.update()
 
                 start_frame = scene.frame_start
+                if use_mrxen0_fk_import:
+                    fk_mode_value = 0.0
+                    fk_props = _set_mrxen0_fk_mode(ao, start_frame, fk_mode_value)
+                    if fk_props:
+                        print(
+                            "Blender Addon: MrXen0 import rig properties: "
+                            + ", ".join(fk_props)
+                        )
+
                 for bone in ao.pose.bones:
-                    if is_deform_rig:
+                    if use_mrxen0_fk_import:
+                        is_transformable = bone.name in set(mrxen0_source_to_target.values())
+                    elif is_deform_rig:
                         is_transformable = bone.bone.use_deform
                     else:
                         # Handle both boolean True and integer 1 for backward compatibility
                         # We check truthiness to support both True (bool) and 1 (int)
                         is_transformable = bool(bone.bone.get("is_transformable", False))
                     if is_transformable:
+                        if use_mrxen0_fk_import:
+                            bone.rotation_mode = "QUATERNION"
                         all_bone_data[bone.name] = {
                             start_frame: {
                                 "location": bone.location.copy(),
@@ -339,47 +744,59 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
             for kf_data in animation_data["kfs"]:
                 frame = int(kf_data["t"] * fps)
                 state = kf_data["kf"]
+                mrxen0_source_pose_matrices = {}
+                mrxen0_expected_source_matrices = {}
 
                 bones_to_process = []
-                for bone_name in state.keys():
-                    pose_bone = ao.pose.bones.get(bone_name)
+                for source_bone_name in state.keys():
+                    if use_mrxen0_fk_import:
+                        target_bone_name = mrxen0_source_to_target.get(source_bone_name)
+                        pose_bone = ao.pose.bones.get(target_bone_name) if target_bone_name else None
+                    else:
+                        target_bone_name = source_bone_name
+                        pose_bone = ao.pose.bones.get(source_bone_name)
                     if pose_bone:
-                        bones_to_process.append(pose_bone)
+                        bones_to_process.append((pose_bone, source_bone_name, target_bone_name))
 
-                bones_to_process.sort(key=lambda b: len(b.parent_recursive))
+                if use_mrxen0_fk_import:
+                    bones_to_process.sort(key=lambda item: _mrxen0_source_depth(item[1]))
+                else:
+                    bones_to_process.sort(key=lambda item: len(item[0].parent_recursive))
 
                 # Simplified single-pass processing loop.
                 # By iterating through bones sorted by hierarchy (parents first), we ensure
                 # that when we calculate a child's matrix, the parent's matrix for the
                 # current frame has already been set.
-                for pose_bone in bones_to_process:
+                for pose_bone, source_bone_name, bone_name in bones_to_process:
                     bone_name = pose_bone.name
-                    pose_data = state.get(bone_name)
+                    pose_data = state.get(source_bone_name)
                     if not pose_data:
                         continue
 
                     # Backwards compatibility: Handle old list-based format and new dict-based format.
-                    easing_style = "Linear"  # Default easing
-                    easing_direction = "In"  # Default easing
-
-                    if isinstance(pose_data, list) and len(pose_data) == 3:
-                        # New, more robust format: [ [cframe_components], "EasingStyle", "EasingDirection" ]
-                        cframe_components = pose_data[0]
-                        easing_style = pose_data[1]
-                        easing_direction = pose_data[2]
-                    elif isinstance(pose_data, dict):
-                        # old format with easing styles
-                        cframe_components = pose_data.get("components", [])
-                        easing_style = pose_data.get("easingStyle", "Linear")
-                        easing_direction = pose_data.get("easingDirection", "In")
-                    elif isinstance(pose_data, list):
-                        # oldest format, just a list of cframe components
-                        cframe_components = pose_data
+                    cframe_components, easing_style, easing_direction = _extract_pose_cframe(pose_data)
 
                     if not cframe_components:
                         continue
 
                     bone_transform = cf_to_mat(cframe_components)
+
+                    if use_mrxen0_fk_import:
+                        expected_source_matrix = _apply_source_delta_to_mrxen0_control(
+                            ao,
+                            source_bone_name,
+                            bone_name,
+                            bone_transform,
+                            mrxen0_source_pose_matrices,
+                        )
+                        if expected_source_matrix is not None:
+                            mrxen0_expected_source_matrices[source_bone_name] = (
+                                expected_source_matrix.copy()
+                            )
+                        bpy.context.view_layer.update()
+                        final_matrix = None
+                    else:
+                        final_matrix = None
 
                     # --- Matrix Calculation ---
                     # Check if this bone has Motor6D properties (from rig build)
@@ -389,7 +806,9 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                         and "transform1" in pose_bone.bone
                     )
 
-                    if not has_motor6d_props:
+                    if use_mrxen0_fk_import:
+                        pass
+                    elif not has_motor6d_props:
                         # Simple delta path - works for deform bones and any bone without Motor6D data
                         # The transform is a LOCAL delta in the bone's own space.
                         # Just apply it directly to the rest pose.
@@ -436,7 +855,8 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                         )
 
                     # --- Apply and Store ---
-                    pose_bone.matrix = final_matrix
+                    if final_matrix is not None:
+                        pose_bone.matrix = final_matrix
 
                     if bone_name in all_bone_data:
                         all_bone_data[bone_name][frame] = {
@@ -446,6 +866,47 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                             "easingStyle": easing_style,
                             "easingDirection": easing_direction,
                         }
+
+                if use_mrxen0_fk_import and frame in mrxen0_verify_sample_frames:
+                    bpy.context.view_layer.update()
+                    for source_name, expected_matrix in mrxen0_expected_source_matrices.items():
+                        source_bone = ao.pose.bones.get(source_name)
+                        if not source_bone:
+                            continue
+                        loc_error, rot_error_deg = _mrxen0_matrix_error(
+                            expected_matrix,
+                            source_bone.matrix,
+                        )
+                        mrxen0_verify_errors.append(
+                            (frame, source_name, loc_error, rot_error_deg)
+                        )
+
+            if use_mrxen0_fk_import and mrxen0_verify_errors:
+                max_loc_error = max(error[2] for error in mrxen0_verify_errors)
+                max_rot_error = max(error[3] for error in mrxen0_verify_errors)
+                avg_loc_error = sum(error[2] for error in mrxen0_verify_errors) / len(
+                    mrxen0_verify_errors
+                )
+                avg_rot_error = sum(error[3] for error in mrxen0_verify_errors) / len(
+                    mrxen0_verify_errors
+                )
+                print(
+                    "Blender Addon: MrXen0 verification summary "
+                    f"samples={len(mrxen0_verify_sample_frames)} "
+                    f"comparisons={len(mrxen0_verify_errors)} "
+                    f"max_loc={max_loc_error:.6f} avg_loc={avg_loc_error:.6f} "
+                    f"max_rot_deg={max_rot_error:.4f} avg_rot_deg={avg_rot_error:.4f}"
+                )
+                for frame, source_name, loc_error, rot_error_deg in sorted(
+                    mrxen0_verify_errors,
+                    key=lambda error: (error[3], error[2]),
+                    reverse=True,
+                )[:8]:
+                    print(
+                        "Blender Addon: MrXen0 verify worst "
+                        f"frame={frame} bone={source_name} "
+                        f"loc={loc_error:.6f} rot_deg={rot_error_deg:.4f}"
+                    )
 
             for bone_name, frame_data in all_bone_data.items():
                 sorted_frames = sorted(frame_data.keys())
@@ -627,8 +1088,14 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
             pending_responses[task_id] = (True, "Animation imported successfully")
 
-        # Run import wrapped with IK preservation (FK import then bake back to IK)
-        import_animation_preserve_ik(_do_import)
+        if _is_mrxen0_r15_rig(ao):
+            # MrXen0's rig has its own PROPERTIES-driven FK/IK system.
+            # The generic IK preservation pass would clear FK curves on IK chains,
+            # which is exactly where this retarget writes the imported motion.
+            _do_import()
+        else:
+            # Run import wrapped with IK preservation (FK import then bake back to IK)
+            import_animation_preserve_ik(_do_import)
 
     except Exception as e:
         print(f"Error in main thread (import_animation): {str(e)}")
