@@ -153,6 +153,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             account_box.label(text="Not logged in, required for deform/skinned rigs.", icon="INFO")
             login_row = account_box.row()
             login_row.scale_y = 1.2
+            login_row.alert = True
             login_row.operator(
                 "rbx.oauth_login",
                 text="Log In to Roblox",
