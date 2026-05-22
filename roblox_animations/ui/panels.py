@@ -107,14 +107,18 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         )
 
         # --- 2. LIVE-SYNC SERVER & UPDATES ---
+        from ..core import auth  # noqa: PLC0415
+
         server_box = layout.box()
         row = server_box.row(align=True)  # Align row elements
         row.label(text="Connection", icon="WORLD_DATA")
 
+        logged_in = auth.is_logged_in()
         row = server_box.row(align=True)
         if not get_server_status():
             start_row = row.row(align=True)
             start_row.scale_y = 1.2
+            start_row.enabled = logged_in
             start_row.operator(
                 "object.start_server",
                 text="Start Server",
@@ -125,10 +129,10 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             row.operator("object.stop_server", text="Stop Server", icon="PAUSE")
         settings = getattr(scene, "rbx_anim_settings", None)
         row.prop(settings, "rbx_server_port", text="")
+        if not logged_in and not get_server_status():
+            server_box.label(text="Log in before starting the server.", icon="ERROR")
 
         # --- 2b. ROBLOX ACCOUNT ---
-        from ..core import auth  # noqa: PLC0415
-
         account_box = layout.box()
         account_box.label(text="Roblox Account", icon="USER")
         online_access_allowed = auth.is_online_access_allowed()

@@ -3,6 +3,7 @@ Server management operators.
 """
 
 import bpy
+from ..core import auth
 from ..server.server import start_server, stop_server
 
 
@@ -12,6 +13,10 @@ class StartServerOperator(bpy.types.Operator):
 
     def execute(self, context):
         try:
+            if not auth.is_logged_in():
+                self.report({"ERROR"}, "Log in to Roblox before starting the server")
+                return {"CANCELLED"}
+
             settings = getattr(context.scene, "rbx_anim_settings", None)
             port = settings.rbx_server_port if settings else None
             if not port:
