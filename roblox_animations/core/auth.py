@@ -5,7 +5,7 @@ Flow (mirrors the Roblox Blender Plugin):
   1. Generate PKCE verifier + challenge (SHA-256, base64url).
   2. Generate random CSRF state.
   3. Open browser to the Roblox authorization URL.
-  4. Start a local HTTP server on localhost:31337 in a background thread.
+  4. Start a local HTTP server on localhost:31338 in a background thread.
     5. User approves in browser → Roblox redirects to either localhost or a hosted callback page.
     6. The local callback handler exchanges the auth-code + verifier for tokens using the same redirect URI that started the flow.
   7. Timer callback on the main thread stores the tokens in memory for this session.
@@ -46,7 +46,7 @@ _AUTH_URL = "https://apis.roblox.com/oauth/v1/authorize"
 _TOKEN_URL = "https://apis.roblox.com/oauth/v1/token"
 _REVOKE_URL = "https://apis.roblox.com/oauth/v1/token/revoke"
 _REDIRECT_PATH = "/oauth2/callback"
-_PORT = 31337  
+_PORT = 31338
 _HOSTED_REDIRECT_ENV = "RBX_OAUTH_REDIRECT_URI"
 # Asset delivery is documented under the legacy asset management scope even
 # though other Assets API endpoints use asset:read / asset:write.
@@ -439,7 +439,7 @@ def start_login_async() -> None:
     if not client_id:
         raise ValueError("Roblox OAuth client ID is missing (this should not happen).")
 
-    # Cancel any stale login thread so port 31337 is freed before we rebind
+    # Cancel any stale login thread so port 31338 is freed before we rebind
     if _login_thread is not None and _login_thread.is_alive():
         _login_cancel.set()
         _login_thread.join(timeout=3.0)
